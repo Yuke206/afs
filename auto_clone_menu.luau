@@ -132,6 +132,7 @@ local AttemptTravel = Remote:WaitForChild("AttemptTravel")
 local SummonDungeon = Remote:WaitForChild("SummonDungeon")
 local SetDungeonSetting = Remote:WaitForChild("SetDungeonSetting")
 local ManagePet = Remote:WaitForChild("ManagePet")
+local GetLocalEnemyHealth = Remote:FindFirstChild("GetLocalEnemyHealth")
 local ChangeTitle = Remote:WaitForChild("ChangeTitle")
 local AttemptAvatarEquip = Remote:WaitForChild("AttemptAvatarEquip")
 local EquipAura = Remote:WaitForChild("EquipAura")
@@ -409,6 +410,8 @@ local DungeonFarm = {
     goldDoorsOpened = {},
     goldRoomsOpened = {},
     completedChests = {},
+    enemyHealthProbeAt = {},
+    enemySeenAt = {},
     teamApplied = false,
     teamApplying = false,
     teleportDistance = 120,
@@ -2818,12 +2821,10 @@ local function copyEquippedPets()
 end
 
 local function applyEquippedPets(desired)
-    local current = getStoreTable("EquippedPets", true)
     local amount = 0
     pcall(function()
         amount = tonumber(GetMultiplier.EquipAmount(LocalPlayer)) or 0
     end)
-    local localData = getStoreTable("EquippedPets")
     desired = type(desired) == "table" and desired or {}
 
     if amount < 1 then
@@ -2842,8 +2843,7 @@ local function applyEquippedPets(desired)
         return data[tostring(slot)] or data[slot]
     end
 
-    local function matchesTarget()
-        local actual = getStoreTable("EquippedPets", true)
+    local function matchesTarget(actual)
         for slot = 1, amount do
             if tostring(slotValue(actual, slot) or "") ~= tostring(target[slot] or "") then
                 return false
@@ -2854,53 +2854,50 @@ local function applyEquippedPets(desired)
 
     local function sendChanges()
         local actual = getStoreTable("EquippedPets", true)
-        local changed = false
-
+        local sentEquip = {}
         for slot = 1, amount do
             local oldUID = slotValue(actual, slot)
             local newUID = target[slot]
             if tostring(oldUID or "") ~= tostring(newUID or "") and oldUID then
-                protectedCall("Unequip dungeon pet", function()
+                pcall(function()
                     ManagePet:FireServer(oldUID, "Unequip")
                 end)
-                changed = true
-                task.wait(0.08)
             end
-        end
-
-        for slot = 1, amount do
-            local oldUID = slotValue(actual, slot)
-            local newUID = target[slot]
-            if newUID and tostring(oldUID or "") ~= tostring(newUID) then
-                protectedCall("Equip dungeon pet", function()
+            if newUID and tostring(oldUID or "") ~= tostring(newUID)
+                and not sentEquip[tostring(newUID)] then
+                pcall(function()
                     ManagePet:FireServer(newUID, "Equip", slot)
                 end)
-                changed = true
-                task.wait(0.08)
+                sentEquip[tostring(newUID)] = true
             end
         end
-        return changed
     end
 
-    for _ = 1, 3 do
+    for _ = 1, 8 do
         sendChanges()
-        if matchesTarget() then
-            localData = getStoreTable("EquippedPets", true)
-            setStoreValue("EquippedPets", localData, 2)
+        task.wait(0.5)
+        if matchesTarget(getStoreTable("EquippedPets", true)) then
+            local localData = getStoreTable("EquippedPets")
+            for slot = 1, amount do
+                localData[tostring(slot)] = target[slot] or nil
+            end
+            setStoreValue("EquippedPets", localData, 1)
             return true
         end
-        task.wait(0.35)
     end
 
+    -- One final pass mirrors the game's team handler without masking a partial sync.
+    sendChanges()
+    task.wait(0.5)
+    if not matchesTarget(getStoreTable("EquippedPets", true)) then
+        return false, "Team pet chua dong bo du so luong equip."
+    end
+    local localData = getStoreTable("EquippedPets")
     for slot = 1, amount do
         localData[tostring(slot)] = target[slot] or nil
     end
-    setStoreValue("EquippedPets", localData, 2)
-    task.wait(0.35)
-    if matchesTarget() then
-        return true
-    end
-    return false, "Team pet chua dong bo du so luong equip."
+    setStoreValue("EquippedPets", localData, 1)
+    return true
 end
 
 local function applyDungeonTeam(index)
@@ -2915,35 +2912,50 @@ local function applyDungeonTeam(index)
     return team
 end
 
-local function applyDungeonTitle(title)
+local function applyDungeonTitle(title, force)
     title = cleanText(title)
-    protectedCall("Change title", function()
-        ChangeTitle:FireServer(title == "" and "Unequip" or title)
-    end)
+    local current = cleanText(getStoreValue("CurrentTitle", true, "") or "")
+    if force or current ~= title then
+        protectedCall("Change title", function()
+            ChangeTitle:FireServer(title == "" and "Unequip" or title)
+        end)
+    end
     setStoreValue("CurrentTitle", title, 2)
 end
 
-local function applyDungeonAvatar(avatar)
+local function applyDungeonAvatar(avatar, force)
     avatar = cleanText(avatar)
-    protectedCall("Equip avatar", function()
-        AttemptAvatarEquip:InvokeServer(avatar)
-    end)
+    local current = cleanText(getStoreValue("CurrentAvatar", true, "") or "")
+    if force or current ~= avatar then
+        local selected = avatar ~= "" and avatar or current
+        if selected ~= "" then
+            protectedCall("Equip avatar", function()
+                AttemptAvatarEquip:InvokeServer(selected)
+            end)
+        end
+    end
     setStoreValue("CurrentAvatar", avatar, 2)
 end
 
-local function applyDungeonAura(aura)
+local function applyDungeonAura(aura, force)
     aura = cleanText(aura)
-    protectedCall("Equip aura", function()
-        EquipAura:FireServer(aura)
-    end)
+    local current = cleanText(getStoreValue("CurrentAura", true, "") or "")
+    if force or current ~= aura then
+        protectedCall("Equip aura", function()
+            EquipAura:FireServer(aura)
+        end)
+    end
     setStoreValue("CurrentAura", aura, 2)
 end
 
-local function applyDungeonArtifact(artifact, slot)
+local function applyDungeonArtifact(artifact, slot, force)
     artifact = cleanText(artifact)
-    protectedCall("Equip artefact", function()
-        EquipArtefact:FireServer(artifact, slot)
-    end)
+    local current = cleanText(getStoreValue(slot, true, "") or "")
+    if force or current ~= artifact then
+        protectedCall("Equip artefact", function()
+            EquipArtefact:FireServer(artifact, slot)
+        end)
+    end
     setStoreValue(slot, artifact, 1)
 end
 
@@ -2952,32 +2964,33 @@ local function applyDungeonLoadout(loadout)
         return
     end
 
-    local avatar = loadout.Avatar
-    if type(avatar) == "string" and avatar ~= "" then
-        applyDungeonAvatar(avatar)
-    end
+    local avatar = type(loadout.Avatar) == "string" and cleanText(loadout.Avatar) or nil
+    local aura = type(loadout.Aura) == "string" and cleanText(loadout.Aura) or nil
+    local title = type(loadout.Title) == "string" and cleanText(loadout.Title) or nil
+    local artifact = type(loadout.Artefact) == "string" and cleanText(loadout.Artefact) or nil
+    local secondArtifact = type(loadout.SecondArtefact) == "string"
+        and cleanText(loadout.SecondArtefact)
+        or nil
 
-    local aura = loadout.Aura
-    if type(aura) == "string" then
-        protectedCall("Equip team aura", function()
-            EquipAura:FireServer(aura)
-        end)
-        setStoreValue("CurrentAura", aura, 2)
-    end
-
-    local title = loadout.Title
-    if type(title) == "string" then
-        applyDungeonTitle(title)
-    end
-
-    local artifact = loadout.Artefact
-    if type(artifact) == "string" then
-        applyDungeonArtifact(artifact, "CurrentArtefact")
-    end
-
-    local secondArtifact = loadout.SecondArtefact
-    if type(secondArtifact) == "string" then
-        applyDungeonArtifact(secondArtifact, "CurrentSecondArtefact")
+    -- Team loadouts can be applied while the store is still catching up after teleport.
+    -- Re-send the five fields so the visual state and the saved team stay aligned.
+    for _ = 1, 3 do
+        if avatar ~= nil then
+            applyDungeonAvatar(avatar, true)
+        end
+        if aura ~= nil then
+            applyDungeonAura(aura, true)
+        end
+        if title ~= nil then
+            applyDungeonTitle(title, true)
+        end
+        if artifact ~= nil then
+            applyDungeonArtifact(artifact, "CurrentArtefact", true)
+        end
+        if secondArtifact ~= nil then
+            applyDungeonArtifact(secondArtifact, "CurrentSecondArtefact", true)
+        end
+        task.wait(0.35)
     end
 end
 
@@ -3063,10 +3076,13 @@ end
 function DungeonFarm.getActiveDungeonInfo()
     local worlds = workspace:FindFirstChild("Worlds")
     local dungeon = worlds and worlds:FindFirstChild("Dungeon")
-    if dungeon and dungeon:GetAttribute("Active") then
+    if dungeon and dungeon:GetAttribute("Active") == true then
         local ownerValue = dungeon:FindFirstChild("FriendsWithUserId")
         local ownerId = ownerValue and tonumber(ownerValue.Value) or 0
-        return dungeon, ownerId
+        -- Ignore a stale Active flag when the server has no live dungeon owner.
+        if ownerId > 0 and (ownerId == LocalPlayer.UserId or Players:GetPlayerByUserId(ownerId)) then
+            return dungeon, ownerId
+        end
     end
     return nil, 0
 end
@@ -3430,6 +3446,76 @@ function DungeonFarm.flyTo(targetPart, token)
     return reached
 end
 
+function DungeonFarm.isLiveEnemy(enemy, enemies)
+    if not (enemy and enemy.Parent == enemies and enemy:IsA("Model")) then
+        return false, false
+    end
+
+    local now = os.clock()
+    DungeonFarm.enemySeenAt[enemy] = DungeonFarm.enemySeenAt[enemy] or now
+    local dead = false
+    local aliveFlag = true
+    pcall(function()
+        dead = enemy:GetAttribute("Dead") == true or enemy:GetAttribute("IsDead") == true
+        aliveFlag = enemy:GetAttribute("Alive") ~= false
+    end)
+    if dead or not aliveFlag then
+        return false, false
+    end
+
+    local health = Feature.getHealth(enemy)
+    local attackable = CollectionService:HasTag(enemy, "Attackable")
+    if health ~= nil and health <= 0 then
+        return false, false
+    end
+    if attackable then
+        return true, false
+    end
+
+    -- A dead model can keep a stale positive Health value after Attackable is removed.
+    -- Ask the game's local-health endpoint first, then age out an unresolved model.
+    if GetLocalEnemyHealth then
+        local lastProbe = DungeonFarm.enemyHealthProbeAt[enemy] or 0
+        if now - lastProbe >= 1 then
+            DungeonFarm.enemyHealthProbeAt[enemy] = now
+            local ok, serverHealth = pcall(function()
+                return GetLocalEnemyHealth:InvokeServer(enemy)
+            end)
+            serverHealth = ok and tonumber(serverHealth) or nil
+            if serverHealth ~= nil then
+                local healthValue = enemy:FindFirstChild("Health", true)
+                if healthValue and healthValue:IsA("NumberValue") then
+                    healthValue.Value = serverHealth
+                end
+                return serverHealth > 0, false
+            end
+        end
+    end
+
+    if now - DungeonFarm.enemySeenAt[enemy] < 3 then
+        return false, true
+    end
+    return false, false
+end
+
+function DungeonFarm.getLiveEnemies(dungeon)
+    local enemies = dungeon and dungeon:FindFirstChild("Enemies")
+    local result = {}
+    local uncertain = false
+    if not enemies then
+        return result, false
+    end
+    for _, enemy in ipairs(enemies:GetChildren()) do
+        local live, unknown = DungeonFarm.isLiveEnemy(enemy, enemies)
+        if live then
+            table.insert(result, enemy)
+        elseif unknown then
+            uncertain = true
+        end
+    end
+    return result, uncertain
+end
+
 function DungeonFarm.clearEnemies(dungeon, token)
     local enemies = dungeon and dungeon:FindFirstChild("Enemies")
     local sendEvent = Bindable:FindFirstChild("SendPet")
@@ -3438,24 +3524,6 @@ function DungeonFarm.clearEnemies(dungeon, token)
     end
     if not sendEvent then
         return false, "Bindable.SendPet khong ton tai."
-    end
-
-    local function isLiveEnemy(enemy)
-        if not (enemy and enemy.Parent == enemies and enemy:IsA("Model")) then
-            return false
-        end
-        local health = Feature.getHealth(enemy)
-        return health == nil or health > 0
-    end
-
-    local function getLiveEnemies()
-        local result = {}
-        for _, enemy in ipairs(enemies:GetChildren()) do
-            if isLiveEnemy(enemy) then
-                table.insert(result, enemy)
-            end
-        end
-        return result
     end
 
     local function sendToEnemy(enemy)
@@ -3480,8 +3548,12 @@ function DungeonFarm.clearEnemies(dungeon, token)
             return false, "Combat qua lau, het thoi gian cho room."
         end
 
-        local enemyList = getLiveEnemies()
+        local enemyList, uncertain = DungeonFarm.getLiveEnemies(dungeon)
         if #enemyList == 0 then
+            if uncertain then
+                task.wait(0.25)
+                continue
+            end
             DungeonFarm.lastEnemyCount = 0
             return true, "Da clear enemy."
         end
@@ -3502,7 +3574,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
         end
 
         local lastSend = 0
-        while isLiveEnemy(enemy) do
+        while DungeonFarm.isLiveEnemy(enemy, enemies) do
             if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
                 return false, "Da dung dungeon farm."
             end
@@ -3522,7 +3594,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
                 lastSend = os.clock()
             end
 
-            local remaining = #getLiveEnemies()
+            local remaining = #DungeonFarm.getLiveEnemies(dungeon)
             DungeonFarm.lastEnemyCount = remaining
             DungeonFarm.updateStatus(
                 "Dungeon Farm: COMBAT",
@@ -3536,7 +3608,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
             task.wait(0.25)
         end
 
-        DungeonFarm.lastEnemyCount = #getLiveEnemies()
+        DungeonFarm.lastEnemyCount = #DungeonFarm.getLiveEnemies(dungeon)
         DungeonFarm.updateStatus(
             "Dungeon Farm: COMBAT",
             string.format(
@@ -3690,6 +3762,8 @@ function DungeonFarm.start()
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
+    DungeonFarm.enemyHealthProbeAt = {}
+    DungeonFarm.enemySeenAt = {}
     DungeonFarm.startedAt = os.clock()
     DungeonFarm.lastMessage = "Dang tim ConfirmPart active."
 
@@ -3709,7 +3783,8 @@ function DungeonFarm.start()
                 task.wait(0.5)
             else
                 local enemies = dungeon:FindFirstChild("Enemies")
-                if enemies and #enemies:GetChildren() > 0 then
+                local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+                if #liveEnemies > 0 or uncertainEnemies then
                     DungeonFarm.phase = "combat"
                     local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
                     if not ok then
@@ -3793,7 +3868,8 @@ function DungeonFarm.start()
                                 local lastActivation = 0
                                 local activationAttempts = 0
                                 while alive() and dungeonActive and DungeonFarm.enabled and token == DungeonFarm.token do
-                                    if enemies and #enemies:GetChildren() > 0 then
+                                    local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+                                    if #liveEnemies > 0 or uncertainEnemies then
                                         transitioned = true
                                         break
                                     end
@@ -3852,7 +3928,8 @@ function DungeonFarm.start()
                                     return
                                 end
 
-                                if enemies and #enemies:GetChildren() > 0 then
+                                local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+                                if #liveEnemies > 0 or uncertainEnemies then
                                     DungeonFarm.phase = "combat"
                                     local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
                                     if not ok then
@@ -3901,6 +3978,8 @@ local function restoreDungeonSession(reason)
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
+    DungeonFarm.enemyHealthProbeAt = {}
+    DungeonFarm.enemySeenAt = {}
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
     DungeonFarm.lastMessage = reason or "Da khoi phuc cau hinh"
@@ -4106,6 +4185,9 @@ local function startAutoDungeon()
     task.spawn(function()
         local lastTravelAttempt = 0
         local activeSeen = false
+        local summonStartedAt = os.clock()
+        local lastSummonAt = summonStartedAt
+        local summonAttempts = 1
         for _ = 1, 480 do
             if not alive() or not dungeonActive then
                 return
@@ -4132,11 +4214,37 @@ local function startAutoDungeon()
             local openDungeon = DungeonFarm.getOpenDungeon()
             if not openDungeon then
                 activeSeen = false
-                DungeonFarm.phase = "waiting_activation"
-                DungeonFarm.updateStatus(
-                    "Dungeon Farm: CHO MO",
-                    "Dang cho Dungeon.Active bat truoc khi teleport..."
-                )
+                local serverBusy = DungeonFarm.isDungeonOccupied()
+                if serverBusy then
+                    DungeonFarm.phase = "waiting_server"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: CHO SLOT",
+                        "Server vua co dungeon khac; se thu lai sau khi slot trong."
+                    )
+                elseif os.clock() - lastSummonAt >= 8 and summonAttempts < 3 then
+                    summonAttempts = summonAttempts + 1
+                    lastSummonAt = os.clock()
+                    DungeonFarm.phase = "summoning"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: MO LAI",
+                        string.format("Chua thay dungeon; gui lai yeu cau mo lan %d/3...", summonAttempts)
+                    )
+                    protectedCall("Retry summon dungeon", function()
+                        SummonDungeon:FireServer(dungeonSelection.mode == "Friends", {
+                            Theme = dungeonSelection.mapId,
+                            Size = dungeonSelection.size
+                        })
+                    end)
+                elseif os.clock() - summonStartedAt >= 45 then
+                    DungeonFarm.fail("Khong xac nhan duoc dungeon sau 45 giay.", DungeonFarm.token)
+                    return
+                else
+                    DungeonFarm.phase = "waiting_activation"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: DANG MO",
+                        "Dang cho server xac nhan Dungeon.Active..."
+                    )
+                end
                 task.wait(0.25)
                 continue
             end
@@ -5077,6 +5185,3 @@ if fileExists(ConfigPath) then
 else
     finishSetup(false)
 end
-
-
-
