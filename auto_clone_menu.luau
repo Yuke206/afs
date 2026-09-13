@@ -1956,7 +1956,7 @@ function AutoPassive.autoPassiveHasTarget()
 end
 
 function AutoPassive.autoPassiveRollOne(uid, reservedCost)
-    local pet, before = AutoPassive.getAutoPassiveCurrentValue(uid, Feature.autoPassiveSlot)
+    local pet = AutoPassive.getAutoPassivePet(uid)
     if not pet then
         return false, "pet khong ton tai"
     end
@@ -1966,70 +1966,78 @@ function AutoPassive.autoPassiveRollOne(uid, reservedCost)
     end
     local category = AutoPassive.autoPassiveCategoryValue()
     local useTokens = Feature.autoPassiveCurrency == "token"
-    local pickedPassives
-    local pickedConnection
-    local pickedEvent = Remote:FindFirstChild("PickedPassive")
-    if pickedEvent then
-        local connected, connection = pcall(function()
-            return pickedEvent.OnClientEvent:Connect(function(passives)
-                pickedPassives = passives
-            end)
-        end)
-        if connected then
-            pickedConnection = connection
-        end
-    end
-
-    local function disconnectPicked()
-        if pickedConnection then
-            pcall(function()
-                pickedConnection:Disconnect()
-            end)
-            pickedConnection = nil
-        end
-    end
-
     local ok, err = pcall(function()
         Remote.RollPassive:FireServer(uid, category, useTokens, Feature.autoPassiveSlot, selected)
     end)
     if not ok then
-        disconnectPicked()
         return false, tostring(err)
     end
     Feature.autoPassiveRollCount = Feature.autoPassiveRollCount + 1
-    Feature.autoPassiveLastMessage = string.format("Dang cho ket qua UID:%s (%s)", tostring(uid), tostring(reservedCost))
+    Feature.autoPassiveLastMessage = string.format("Da gui roll UID:%s (%s)", tostring(uid), tostring(reservedCost))
     Feature.updateAutoPassiveStatus()
+    return true
+end
 
-    local deadline = os.clock() + 2
-    while pickedPassives == nil and os.clock() < deadline do
-        if not alive() or not Feature.autoPassiveEnabled then
-            disconnectPicked()
-            return true, tostring(before or "")
-        end
-        task.wait(0.05)
-    end
-    disconnectPicked()
-
-    if pickedPassives ~= nil then
-        task.wait(0.1)
-        local result = type(pickedPassives) == "table" and pickedPassives[Feature.autoPassiveSlot] or nil
-        return true, tostring(result or "")
-    end
-
-    local beforeKey = tostring(before or "")
-    local fallbackDeadline = os.clock() + 0.75
-    while os.clock() < fallbackDeadline do
-        if not alive() or not Feature.autoPassiveEnabled then
-            return true, tostring(before or "")
-        end
-        task.wait(0.05)
-        local _, current = AutoPassive.getAutoPassiveCurrentValue(uid, Feature.autoPassiveSlot)
-        if current ~= nil and tostring(current) ~= beforeKey then
-            return true, tostring(current)
+function AutoPassive.autoPassiveRollBatch(jobs, runToken)
+    local pickedEvent = Remote:FindFirstChild("PickedPassive")
+    local responseCount = 0
+    local connection
+    if pickedEvent then
+        local connected, result = pcall(function()
+            return pickedEvent.OnClientEvent:Connect(function()
+                responseCount = responseCount + 1
+            end)
+        end)
+        if connected then
+            connection = result
         end
     end
-    local _, current = AutoPassive.getAutoPassiveCurrentValue(uid, Feature.autoPassiveSlot)
-    return true, tostring(current or "")
+
+    local fired = 0
+    for _, jobData in ipairs(jobs) do
+        if not alive() or not Feature.autoPassiveEnabled or runToken ~= Feature.autoPassiveRunToken then
+            break
+        end
+        local ok, result = AutoPassive.autoPassiveRollOne(jobData.uid, jobData.cost)
+        if ok then
+            fired = fired + 1
+        else
+            Feature.autoPassiveLastMessage = "Loi UID:" .. tostring(jobData.uid) .. " " .. tostring(result)
+            Feature.updateAutoPassiveStatus()
+        end
+    end
+
+    if connection and fired > 0 then
+        local deadline = os.clock() + 1.5
+        while responseCount < fired
+            and alive()
+            and Feature.autoPassiveEnabled
+            and runToken == Feature.autoPassiveRunToken
+            and os.clock() < deadline do
+            Feature.autoPassiveLastMessage = string.format(
+                "Dang cho ket qua batch %d/%d",
+                responseCount,
+                fired
+            )
+            Feature.updateAutoPassiveStatus()
+            task.wait()
+        end
+    end
+    if connection then
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    if fired > 0 then
+        Feature.autoPassiveLastMessage = string.format(
+            "Da gui %d roll cung luc; nhan %d ket qua",
+            fired,
+            responseCount
+        )
+        Feature.updateAutoPassiveStatus()
+        task.wait()
+    end
+    return fired, responseCount
 end
 
 function AutoPassive.stopAutoPassive(reason)
@@ -2100,19 +2108,8 @@ function AutoPassive.startAutoPassive()
                 break
             end
 
-            for _, jobData in ipairs(jobs) do
-                if not alive() or not Feature.autoPassiveEnabled or runToken ~= Feature.autoPassiveRunToken then
-                    break
-                end
-                local ok, result = AutoPassive.autoPassiveRollOne(jobData.uid, jobData.cost)
-                if not ok then
-                    Feature.autoPassiveLastMessage = "Loi UID:" .. tostring(jobData.uid) .. " " .. tostring(result)
-                    Feature.updateAutoPassiveStatus()
-                end
-                if Feature.autoPassiveEnabled and runToken == Feature.autoPassiveRunToken then
-                    task.wait(Feature.autoPassiveRollDelay)
-                end
-            end
+            AutoPassive.autoPassiveRollBatch(jobs, runToken)
+            task.wait()
         end
         Feature.autoPassiveBusy = false
         Feature.updateAutoPassiveStatus()
@@ -3025,6 +3022,50 @@ function DungeonFarm.findPrompt(dungeon)
     return nil
 end
 
+function DungeonFarm.getConfirmPartState(dungeon)
+    local map = dungeon and dungeon:FindFirstChild("Map")
+    if not map then
+        return 0, 0, 0
+    end
+
+    local rooms = {}
+    for _, object in ipairs(map:GetDescendants()) do
+        local part
+        if object:IsA("BasePart") and object.Name == "ConfirmPart" then
+            part = object
+        elseif object:IsA("ProximityPrompt")
+            and object.Parent
+            and object.Parent:IsA("BasePart")
+            and object.Parent.Name == "ConfirmPart" then
+            part = object.Parent
+        end
+        if part then
+            local room = part.Parent
+            if room and room:IsA("Model") and room:GetAttribute("MapPos") ~= nil then
+                local key = room:GetFullName()
+                rooms[key] = rooms[key] or {room = room, part = part}
+            end
+        end
+    end
+
+    local total = 0
+    local pending = 0
+    local enabled = 0
+    for key, entry in pairs(rooms) do
+        total = total + 1
+        if not DungeonFarm.completed[key] then
+            pending = pending + 1
+        end
+        for _, object in ipairs(entry.part:GetChildren()) do
+            if object:IsA("ProximityPrompt") and object.Enabled then
+                enabled = enabled + 1
+                break
+            end
+        end
+    end
+    return total, pending, enabled
+end
+
 function DungeonFarm.findRoom(instance, map)
     local current = instance
     while current and current ~= map do
@@ -3563,7 +3604,6 @@ function DungeonFarm.start()
     DungeonFarm.lastMessage = "Dang tim ConfirmPart active."
 
     task.spawn(function()
-        local noPromptSince = 0
         while alive() and dungeonActive and DungeonFarm.enabled and token == DungeonFarm.token do
             if tostring(getPlayerValue("World", "")) ~= "Dungeon" then
                 if token == DungeonFarm.token then
@@ -3586,7 +3626,6 @@ function DungeonFarm.start()
                         DungeonFarm.fail(reason, token)
                         return
                     end
-                    noPromptSince = 0
                 else
                     local chests = DungeonFarm.getChestTargets(dungeon)
                     if #chests > 0 then
@@ -3596,7 +3635,6 @@ function DungeonFarm.start()
                             DungeonFarm.fail(reason, token)
                             return
                         end
-                        noPromptSince = 0
                     else
                         local doorPrompt, doorPart, doorRoom = DungeonFarm.findGoldDoor(dungeon)
                         if doorPrompt then
@@ -3605,38 +3643,41 @@ function DungeonFarm.start()
                                 DungeonFarm.fail(reason, token)
                                 return
                             end
-                            noPromptSince = 0
                             task.wait(0.5)
                         else
                             local prompt, room, part, key = DungeonFarm.findPrompt(dungeon)
                             if not prompt then
-                                local completedCount = 0
-                                for _ in pairs(DungeonFarm.completed) do
-                                    completedCount = completedCount + 1
-                                end
-                                if completedCount > 0 then
-                                    noPromptSince = noPromptSince == 0 and os.clock() or noPromptSince
+                                local totalConfirmParts, pendingConfirmParts, enabledConfirmParts =
+                                    DungeonFarm.getConfirmPartState(dungeon)
+                                if totalConfirmParts == 0 then
+                                    DungeonFarm.phase = "waiting_map"
+                                    DungeonFarm.updateStatus(
+                                        "Dungeon Farm: CHO MAP",
+                                        "Chua thay ConfirmPart nao; dang quet lai map..."
+                                    )
+                                elseif pendingConfirmParts > 0 then
                                     DungeonFarm.phase = "waiting"
                                     DungeonFarm.updateStatus(
-                                        "Dungeon Farm: CHO ROOM",
-                                        string.format("Da clear %d room | Dang cho cot tiep theo...", completedCount)
-                                    )
-                                    if os.clock() - noPromptSince >= 30 then
-                                        DungeonFarm.phase = "waiting_map"
-                                        DungeonFarm.lastMessage = "Chua thay ConfirmPart moi; tiep tuc quet map."
-                                        DungeonFarm.updateStatus(
-                                            "Dungeon Farm: CHO MAP",
-                                            DungeonFarm.lastMessage
+                                        "Dungeon Farm: CHO CONFIRMPART",
+                                        string.format(
+                                            "Da thay %d cot | Con %d room chua clear | Active %d",
+                                            totalConfirmParts,
+                                            pendingConfirmParts,
+                                            enabledConfirmParts
                                         )
-                                        noPromptSince = os.clock()
-                                    end
+                                    )
                                 else
-                                    DungeonFarm.phase = "waiting"
-                                    DungeonFarm.updateStatus("Dungeon Farm: CHO", "Dang cho ConfirmPart dau tien...")
+                                    DungeonFarm.phase = "waiting_map"
+                                    DungeonFarm.updateStatus(
+                                        "Dungeon Farm: CHO ROOM",
+                                        string.format(
+                                            "Da xu ly %d ConfirmPart | Dang cho room tiep theo hoac DungeonFinish...",
+                                            totalConfirmParts
+                                        )
+                                    )
                                 end
                                 task.wait(0.5)
                             else
-                                noPromptSince = 0
                                 DungeonFarm.targetRoom = room
                                 DungeonFarm.targetPart = part
                                 DungeonFarm.room = room.Name
