@@ -122,7 +122,6 @@ local AutoPassiveModules = {
 }
 local GetMultiplier = require(ReplicatedStorage.ModuleScripts.GetMultiplier)
 local WorldData = require(ReplicatedStorage.ModuleScripts.WorldData)
-local TitleData = require(ReplicatedStorage.ModuleScripts.TitleData)
 local ArtefactData = require(ReplicatedStorage.ModuleScripts.ArtefactData)
 local ConfigValues = require(ReplicatedStorage.ModuleScripts.ConfigValues)
 
@@ -135,6 +134,7 @@ local SetDungeonSetting = Remote:WaitForChild("SetDungeonSetting")
 local ManagePet = Remote:WaitForChild("ManagePet")
 local ChangeTitle = Remote:WaitForChild("ChangeTitle")
 local AttemptAvatarEquip = Remote:WaitForChild("AttemptAvatarEquip")
+local EquipAura = Remote:WaitForChild("EquipAura")
 local EquipArtefact = Remote:WaitForChild("EquipArtefact")
 local DungeonFinish = Remote:WaitForChild("DungeonFinish")
 local Bindable = ReplicatedStorage:WaitForChild("Bindable")
@@ -386,10 +386,7 @@ local dungeonMapDropdown
 local dungeonModeDropdown
 local dungeonSizeDropdown
 local dungeonTeamDropdown
-local dungeonArtifactDropdown
 local dungeonSecondArtifactDropdown
-local dungeonTitleDropdown
-local dungeonAvatarDropdown
 local dungeonToggle
 local dungeonToggleUpdating = false
 local dungeonCooldownParagraph
@@ -412,6 +409,8 @@ local DungeonFarm = {
     goldDoorsOpened = {},
     goldRoomsOpened = {},
     completedChests = {},
+    teamApplied = false,
+    teamApplying = false,
     teleportDistance = 120,
     flySpeed = 140,
     teleportDistanceSlider = nil,
@@ -444,17 +443,12 @@ local dungeonMapByOption = {}
 local dungeonSizeByOption = {}
 local dungeonTeamByOption = {}
 local dungeonArtifactByOption = {}
-local dungeonTitleByOption = {}
-local dungeonAvatarByOption = {}
 local dungeonSelection = {
     mapId = "DBZ",
     mode = "Public",
     size = 1,
     teamIndex = 1,
-    artifact = "",
-    secondArtifact = "",
-    title = "",
-    avatar = ""
+    secondArtifact = ""
 }
 local scanPets
 local rebuildPetDropdowns
@@ -2763,47 +2757,6 @@ local function makeDungeonArtifactOptions()
     return options
 end
 
-local function makeDungeonTitleOptions()
-    local options = {"(None)"}
-    dungeonTitleByOption["(None)"] = ""
-    for title in pairs(getStoreTable("DiscoveredTitles", true)) do
-        local data = TitleData[title]
-        if type(data) == "table" then
-            local option = title
-            dungeonTitleByOption[option] = title
-            table.insert(options, option)
-        end
-    end
-    table.sort(options)
-    return options
-end
-
-local function makeDungeonAvatarOptions()
-    local options = {"(None)"}
-    dungeonAvatarByOption["(None)"] = ""
-    local avatarStats = getStoreTable("AvatarStats", true)
-    for id, levels in pairs(avatarStats) do
-        local data = PetStats[id]
-        if type(data) == "table" and type(levels) == "table" then
-            local option = string.format(
-                "%s | Lv.%s/%s | %s",
-                data.DisplayName or id,
-                tostring(levels[1] or 0),
-                tostring(levels[2] or 0),
-                id
-            )
-            dungeonAvatarByOption[option] = id
-            table.insert(options, option)
-        end
-    end
-    table.sort(options, function(a, b)
-        if a == "(None)" then return true end
-        if b == "(None)" then return false end
-        return a < b
-    end)
-    return options
-end
-
 local function getDungeonDefaultTeam()
     local equipped = getStoreTable("EquippedPets", true)
     local first = equipped["1"] or equipped[1]
@@ -2858,9 +2811,11 @@ end
 
 local function applyDungeonTeam(index)
     local team = getStoreTable("PetTeams", true)[index]
-    if type(team) == "table" then
-        applyEquippedPets(team.UIDs or {})
+    if type(team) ~= "table" then
+        return false
     end
+    applyEquippedPets(team.UIDs or {})
+    return team
 end
 
 local function applyDungeonTitle(title)
@@ -2879,12 +2834,81 @@ local function applyDungeonAvatar(avatar)
     setStoreValue("CurrentAvatar", avatar, 2)
 end
 
+local function applyDungeonAura(aura)
+    aura = cleanText(aura)
+    protectedCall("Equip aura", function()
+        EquipAura:FireServer(aura)
+    end)
+    setStoreValue("CurrentAura", aura, 2)
+end
+
 local function applyDungeonArtifact(artifact, slot)
     artifact = cleanText(artifact)
     protectedCall("Equip artefact", function()
         EquipArtefact:FireServer(artifact, slot)
     end)
     setStoreValue(slot, artifact, 1)
+end
+
+local function applyDungeonLoadout(loadout)
+    if type(loadout) ~= "table" then
+        return
+    end
+
+    local avatar = loadout.Avatar
+    if type(avatar) == "string" and avatar ~= "" then
+        applyDungeonAvatar(avatar)
+    end
+
+    local aura = loadout.Aura
+    if type(aura) == "string" then
+        protectedCall("Equip team aura", function()
+            EquipAura:FireServer(aura)
+        end)
+        setStoreValue("CurrentAura", aura, 2)
+    end
+
+    local title = loadout.Title
+    if type(title) == "string" then
+        applyDungeonTitle(title)
+    end
+
+    local artifact = loadout.Artefact
+    if type(artifact) == "string" then
+        applyDungeonArtifact(artifact, "CurrentArtefact")
+    end
+
+    local secondArtifact = loadout.SecondArtefact
+    if type(secondArtifact) == "string" then
+        applyDungeonArtifact(secondArtifact, "CurrentSecondArtefact")
+    end
+end
+
+function DungeonFarm.ensureTeamApplied()
+    if DungeonFarm.teamApplied then
+        return true
+    end
+    if DungeonFarm.teamApplying then
+        local deadline = os.clock() + 10
+        while alive() and DungeonFarm.teamApplying and os.clock() < deadline do
+            task.wait(0.1)
+        end
+        return DungeonFarm.teamApplied
+    end
+
+    DungeonFarm.teamApplying = true
+    local ok, team = protectedCall("Apply dungeon team", function()
+        return applyDungeonTeam(dungeonSelection.teamIndex)
+    end)
+    if ok and team then
+        protectedCall("Apply dungeon team loadout", function()
+            applyDungeonLoadout(team.Loadout)
+        end)
+        DungeonFarm.teamApplied = true
+        DungeonFarm.lastMessage = "Da doi sang team dungeon sau khi vao map."
+    end
+    DungeonFarm.teamApplying = false
+    return DungeonFarm.teamApplied
 end
 
 local function getDungeonCooldownInfo()
@@ -3619,6 +3643,8 @@ local function restoreDungeonSession(reason)
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
+    DungeonFarm.teamApplied = false
+    DungeonFarm.teamApplying = false
     DungeonFarm.lastMessage = reason or "Da khoi phuc cau hinh"
     DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", DungeonFarm.lastMessage)
     dungeonWaiting = false
@@ -3647,6 +3673,7 @@ local function restoreDungeonSession(reason)
             applyEquippedPets(session.equippedPets)
             applyDungeonTitle(session.title)
             applyDungeonAvatar(session.avatar)
+            applyDungeonAura(session.aura)
             applyDungeonArtifact(session.artifact, "CurrentArtefact")
             applyDungeonArtifact(session.secondArtifact, "CurrentSecondArtefact")
             local dungeonSettings = type(session.dungeonSettings) == "table" and session.dungeonSettings or {}
@@ -3682,6 +3709,10 @@ DungeonFarm.restore = restoreDungeonSession
 local function startAutoDungeon()
     if tostring(getPlayerValue("World", "")) == "Dungeon" then
         dungeonActive = true
+        if not DungeonFarm.ensureTeamApplied() then
+            DungeonFarm.updateStatus("Dungeon Farm: LOI", "Khong doi duoc team dungeon.")
+            return
+        end
         DungeonFarm.entered = true
         if DungeonFarm.enabled then
             DungeonFarm.start()
@@ -3705,6 +3736,22 @@ local function startAutoDungeon()
         end
         saveConfig(true)
         notifyStatus("Auto Dungeon", "Khong con DungeonSummon.")
+        return
+    end
+
+    local ownedArtifacts = getStoreTable("Artefacts", true)
+    local passageLevel = tonumber(ownedArtifacts.Dungeon or 0) or 0
+    if passageLevel < 1 then
+        Feature.autoDungeonEnabled = false
+        if dungeonToggle then
+            dungeonToggleUpdating = true
+            pcall(function()
+                dungeonToggle:Set(false)
+            end)
+            dungeonToggleUpdating = false
+        end
+        saveConfig(true)
+        notifyStatus("Auto Dungeon", "Can Artifact of Passage de mo dungeon.")
         return
     end
 
@@ -3734,6 +3781,7 @@ local function startAutoDungeon()
         equippedPets = copyEquippedPets(),
         title = getStoreValue("CurrentTitle", true, "") or "",
         avatar = getStoreValue("CurrentAvatar", true, "") or getPlayerValue("CurrentAvatar", "") or "",
+        aura = getStoreValue("CurrentAura", true, "") or "",
         artifact = getStoreValue("CurrentArtefact", true, "") or "",
         secondArtifact = getStoreValue("CurrentSecondArtefact", true, "") or "",
         dungeonSettings = getStoreTable("DungeonSettings", true)
@@ -3752,16 +3800,13 @@ local function startAutoDungeon()
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
+    DungeonFarm.teamApplied = false
+    DungeonFarm.teamApplying = false
     DungeonFarm.startedAt = os.clock()
     DungeonFarm.lastMessage = "Dang tao dungeon..."
     DungeonFarm.updateStatus("Dungeon Farm: START", DungeonFarm.lastMessage)
 
-    applyDungeonTeam(dungeonSelection.teamIndex)
-    applyDungeonTitle(dungeonSelection.title)
-    applyDungeonAvatar(dungeonSelection.avatar)
-    local ownedArtifacts = getStoreTable("Artefacts", true)
-    local passageLevel = tonumber(ownedArtifacts.Dungeon or 0) or 0
-    local openingArtifact = passageLevel > 0 and "Dungeon" or dungeonSelection.artifact
+    local openingArtifact = "Dungeon"
     local openingSecondArtifact = dungeonSelection.secondArtifact == "Dungeon"
         and ""
         or dungeonSelection.secondArtifact
@@ -3799,6 +3844,11 @@ local function startAutoDungeon()
                 return tostring(getPlayerValue("World", "")) == "Dungeon"
             end)
             if checkOK and arrived then
+                DungeonFarm.updateStatus("Dungeon Farm: TEAM", "Da vao dungeon; dang doi team da cai dat...")
+                if not DungeonFarm.ensureTeamApplied() then
+                    DungeonFarm.fail("Khong doi duoc team dungeon sau khi vao map.")
+                    return
+                end
                 DungeonFarm.entered = true
                 notifyStatus("Auto Dungeon", "Da vao dungeon: " .. dungeonSelection.mapId)
                 if DungeonFarm.enabled then
@@ -3844,6 +3894,8 @@ dungeonFinishConnection = DungeonFinish.OnClientEvent:Connect(function()
                     DungeonFarm.running = false
                     DungeonFarm.entered = false
                     dungeonActive = false
+                    DungeonFarm.teamApplied = false
+                    DungeonFarm.teamApplying = false
                     DungeonFarm.phase = "idle"
                     DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Dungeon da hoan tat.")
                 end
@@ -3866,7 +3918,11 @@ if worldValue then
                         and DungeonFarm.enabled
                         and tostring(getPlayerValue("World", "")) == "Dungeon"
                         and not DungeonFarm.running then
-                        DungeonFarm.start()
+                        if DungeonFarm.ensureTeamApplied() then
+                            DungeonFarm.start()
+                        else
+                            DungeonFarm.updateStatus("Dungeon Farm: LOI", "Khong doi duoc team dungeon.")
+                        end
                     end
                 end)
             end
@@ -3882,6 +3938,8 @@ if worldValue then
                         DungeonFarm.running = false
                         DungeonFarm.entered = false
                         dungeonActive = false
+                        DungeonFarm.teamApplied = false
+                        DungeonFarm.teamApplying = false
                         DungeonFarm.phase = "idle"
                         DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Da roi khoi dungeon.")
                     end
@@ -3895,16 +3953,8 @@ local function buildDungeonControls()
     dungeonMapByOption = {}
     dungeonTeamByOption = {}
     dungeonArtifactByOption = {}
-    dungeonTitleByOption = {}
-    dungeonAvatarByOption = {}
     if not configLoaded then
-        local ownedArtifacts = getStoreTable("Artefacts", true)
-        local passageLevel = tonumber(ownedArtifacts.Dungeon or 0) or 0
-        dungeonSelection.artifact = passageLevel > 0 and "Dungeon"
-            or (getStoreValue("CurrentArtefact", true, "") or "")
         dungeonSelection.secondArtifact = getStoreValue("CurrentSecondArtefact", true, "") or ""
-        dungeonSelection.title = getStoreValue("CurrentTitle", true, "") or ""
-        dungeonSelection.avatar = getStoreValue("CurrentAvatar", true, "") or getPlayerValue("CurrentAvatar", "") or ""
     end
     dungeonSizeByOption = {
         Small = 0,
@@ -3930,7 +3980,13 @@ local function buildDungeonControls()
     defaultMap = defaultMap or worlds[1]
 
     local teams = makeDungeonTeamOptions()
-    dungeonSelection.teamIndex = getDungeonDefaultTeam()
+    local teamCount = #getStoreTable("PetTeams", true)
+    if not configLoaded
+        or type(dungeonSelection.teamIndex) ~= "number"
+        or dungeonSelection.teamIndex < 1
+        or dungeonSelection.teamIndex > teamCount then
+        dungeonSelection.teamIndex = getDungeonDefaultTeam()
+    end
     local defaultTeam
     for option, index in pairs(dungeonTeamByOption) do
         if index == dungeonSelection.teamIndex then
@@ -3940,25 +3996,13 @@ local function buildDungeonControls()
     end
 
     local artifacts = makeDungeonArtifactOptions()
-    local titles = makeDungeonTitleOptions()
-    local avatars = makeDungeonAvatarOptions()
     local artifactOptions = {}
     for option, id in pairs(dungeonArtifactByOption) do
-        if id == dungeonSelection.artifact then artifactOptions[1] = option end
         if id == dungeonSelection.secondArtifact then artifactOptions[2] = option end
     end
-    local titleOptions = {}
-    for option, id in pairs(dungeonTitleByOption) do
-        if id == dungeonSelection.title then titleOptions[option] = true end
-    end
-    local avatarOptions = {}
-    for option, id in pairs(dungeonAvatarByOption) do
-        if id == dungeonSelection.avatar then avatarOptions[option] = true end
-    end
-
     DungeonTab:Paragraph({
         Title = "Auto Dungeon",
-        Desc = utf8Text("Chon map, che do, kich thuoc, team, artefact, title va avatar. Sau khi xong se khoi phuc cau hinh cu.", 67, 104, 7885, 110, 32, 109, 97, 112, 44, 32, 99, 104, 7871, 32, 273, 7897, 44, 32, 107, 237, 99, 104, 32, 116, 104, 432, 7899, 99, 44, 32, 116, 101, 97, 109, 44, 32, 97, 114, 116, 101, 102, 97, 99, 116, 44, 32, 116, 105, 116, 108, 101, 32, 118, 224, 32, 97, 118, 97, 116, 97, 114, 46, 32, 83, 97, 117, 32, 107, 104, 105, 32, 120, 111, 110, 103, 32, 115, 7869, 32, 107, 104, 244, 105, 32, 112, 104, 7909, 99, 32, 99, 7845, 117, 32, 104, 236, 110, 104, 32, 99, 361, 46)
+        Desc = "Chon map, mode, kich thuoc va team. Artifact Passage luon duoc dung de mo dungeon; sau khi vao map moi doi sang team da chon."
     })
     dungeonCooldownParagraph = DungeonTab:Button({
         Title = "Cooldown dungeon",
@@ -4005,16 +4049,9 @@ local function buildDungeonControls()
             saveConfig(true)
         end
     })
-    dungeonArtifactDropdown = DungeonTab:Dropdown({
+    DungeonTab:Paragraph({
         Title = "Artefact 1",
-        Values = artifacts,
-        Value = artifactOptions[1] or "(None)",
-        SearchBarEnabled = true,
-        MenuWidth = 300,
-        Callback = function(value)
-            dungeonSelection.artifact = dungeonArtifactByOption[value] or ""
-            saveConfig(true)
-        end
+        Desc = "Artifact of Passage (tu dong khi mo dungeon)."
     })
     dungeonSecondArtifactDropdown = DungeonTab:Dropdown({
         Title = "Artefact 2",
@@ -4024,28 +4061,6 @@ local function buildDungeonControls()
         MenuWidth = 300,
         Callback = function(value)
             dungeonSelection.secondArtifact = dungeonArtifactByOption[value] or ""
-            saveConfig(true)
-        end
-    })
-    dungeonTitleDropdown = DungeonTab:Dropdown({
-        Title = utf8Text("Danh hieu", 68, 97, 110, 104, 32, 104, 105, 7879, 117),
-        Values = titles,
-        Value = next(titleOptions) or "(None)",
-        SearchBarEnabled = true,
-        MenuWidth = 300,
-        Callback = function(value)
-            dungeonSelection.title = dungeonTitleByOption[value] or ""
-            saveConfig(true)
-        end
-    })
-    dungeonAvatarDropdown = DungeonTab:Dropdown({
-        Title = "Avatar",
-        Values = avatars,
-        Value = next(avatarOptions) or "(None)",
-        SearchBarEnabled = true,
-        MenuWidth = 300,
-        Callback = function(value)
-            dungeonSelection.avatar = dungeonAvatarByOption[value] or ""
             saveConfig(true)
         end
     })
@@ -4556,10 +4571,7 @@ syncDungeonControls = function()
     beginDropdownSync()
     selectMapped(dungeonMapDropdown, dungeonMapByOption, dungeonSelection.mapId)
     selectMapped(dungeonTeamDropdown, dungeonTeamByOption, dungeonSelection.teamIndex)
-    selectMapped(dungeonArtifactDropdown, dungeonArtifactByOption, dungeonSelection.artifact)
     selectMapped(dungeonSecondArtifactDropdown, dungeonArtifactByOption, dungeonSelection.secondArtifact)
-    selectMapped(dungeonTitleDropdown, dungeonTitleByOption, dungeonSelection.title)
-    selectMapped(dungeonAvatarDropdown, dungeonAvatarByOption, dungeonSelection.avatar)
     local sizeNames = {[0] = "Small", [1] = "Medium", [2] = "Large", [3] = "Insane", [4] = "Hellish"}
     pcall(function()
         dungeonSizeDropdown:Select(sizeNames[dungeonSelection.size] or "Medium")
@@ -4772,5 +4784,6 @@ if fileExists(ConfigPath) then
 else
     finishSetup(false)
 end
+
 
 
