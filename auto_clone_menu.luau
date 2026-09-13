@@ -3060,13 +3060,33 @@ function DungeonFarm.getDungeon()
     return worlds and worlds:FindFirstChild("Dungeon")
 end
 
-function DungeonFarm.getOpenDungeon()
+function DungeonFarm.getActiveDungeonInfo()
     local worlds = workspace:FindFirstChild("Worlds")
     local dungeon = worlds and worlds:FindFirstChild("Dungeon")
     if dungeon and dungeon:GetAttribute("Active") then
-        return dungeon
+        local ownerValue = dungeon:FindFirstChild("FriendsWithUserId")
+        local ownerId = ownerValue and tonumber(ownerValue.Value) or 0
+        return dungeon, ownerId
     end
-    return nil
+    return nil, 0
+end
+
+function DungeonFarm.getOpenDungeon()
+    local dungeon = DungeonFarm.getActiveDungeonInfo()
+    return dungeon
+end
+
+function DungeonFarm.isDungeonOccupied()
+    if tostring(getPlayerValue("World", "")) == "Dungeon" then
+        return false, nil
+    end
+
+    local dungeon, ownerId = DungeonFarm.getActiveDungeonInfo()
+    if not dungeon then
+        return false, nil
+    end
+
+    return true, ownerId
 end
 
 function DungeonFarm.findPrompt(dungeon)
@@ -3993,22 +4013,42 @@ local function startAutoDungeon()
         return
     end
 
+    local occupied = DungeonFarm.isDungeonOccupied()
     local remaining = getDungeonCooldownInfo()
-    if remaining > 0 then
+    if occupied or remaining > 0 then
         dungeonWaiting = true
         dungeonWaitToken = dungeonWaitToken + 1
         local token = dungeonWaitToken
-        notifyStatus("Auto Dungeon", utf8Text("Dang cho cooldown Artifact of Passage: ", 272, 97, 110, 103, 32, 99, 104, 7901, 32, 99, 111, 111, 108, 100, 111, 119, 110, 32, 65, 114, 116, 105, 102, 97, 99, 116, 32, 111, 102, 32, 80, 97, 115, 115, 97, 103, 101, 58, 32) .. formatDuration(remaining))
+        if occupied then
+            notifyStatus("Auto Dungeon", "Server dang co dungeon cua nguoi khac; se cho den khi hoan tat.")
+        else
+            notifyStatus("Auto Dungeon", utf8Text("Dang cho cooldown Artifact of Passage: ", 272, 97, 110, 103, 32, 99, 104, 7901, 32, 99, 111, 111, 108, 100, 111, 119, 110, 32, 65, 114, 116, 105, 102, 97, 99, 116, 32, 111, 102, 32, 80, 97, 115, 115, 97, 103, 101, 58, 32) .. formatDuration(remaining))
+        end
+        DungeonFarm.phase = occupied and "waiting_server" or "waiting_cooldown"
         task.spawn(function()
             while alive() and dungeonWaiting and token == dungeonWaitToken do
                 local left = getDungeonCooldownInfo()
+                local serverBusy = DungeonFarm.isDungeonOccupied()
                 updateDungeonCooldownStatus()
-                if left <= 0 then
+                if left <= 0 and not serverBusy then
                     dungeonWaiting = false
-                    protectedCall("Start dungeon after cooldown", startAutoDungeon)
+                    protectedCall("Start dungeon after slot is ready", startAutoDungeon)
                     return
                 end
-                task.wait(5)
+                if serverBusy then
+                    DungeonFarm.phase = "waiting_server"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: CHO SLOT",
+                        "Server dang co dungeon khac; se tu dong thu lai sau khi dungeon ket thuc."
+                    )
+                elseif left > 0 then
+                    DungeonFarm.phase = "waiting_cooldown"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: CHO COOLDOWN",
+                        "Artifact of Passage con " .. formatDuration(left) .. "."
+                    )
+                end
+                task.wait(3)
             end
         end)
         return
