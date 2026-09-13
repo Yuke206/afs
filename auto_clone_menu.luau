@@ -1966,25 +1966,66 @@ function AutoPassive.autoPassiveRollOne(uid, reservedCost)
     end
     local category = AutoPassive.autoPassiveCategoryValue()
     local useTokens = Feature.autoPassiveCurrency == "token"
+    local pickedPassives
+    local pickedConnection
+    local pickedEvent = Remote:FindFirstChild("PickedPassive")
+    if pickedEvent then
+        local connected, connection = pcall(function()
+            return pickedEvent.OnClientEvent:Connect(function(passives)
+                pickedPassives = passives
+            end)
+        end)
+        if connected then
+            pickedConnection = connection
+        end
+    end
+
+    local function disconnectPicked()
+        if pickedConnection then
+            pcall(function()
+                pickedConnection:Disconnect()
+            end)
+            pickedConnection = nil
+        end
+    end
+
     local ok, err = pcall(function()
         Remote.RollPassive:FireServer(uid, category, useTokens, Feature.autoPassiveSlot, selected)
     end)
     if not ok then
+        disconnectPicked()
         return false, tostring(err)
     end
     Feature.autoPassiveRollCount = Feature.autoPassiveRollCount + 1
-    Feature.autoPassiveLastMessage = string.format("Dang roll UID:%s (%s)", tostring(uid), tostring(reservedCost))
+    Feature.autoPassiveLastMessage = string.format("Dang cho ket qua UID:%s (%s)", tostring(uid), tostring(reservedCost))
     Feature.updateAutoPassiveStatus()
 
-    local beforeKey = tostring(before or "")
-    for _ = 1, 30 do
+    local deadline = os.clock() + 2
+    while pickedPassives == nil and os.clock() < deadline do
+        if not alive() or not Feature.autoPassiveEnabled then
+            disconnectPicked()
+            return true, tostring(before or "")
+        end
+        task.wait(0.05)
+    end
+    disconnectPicked()
+
+    if pickedPassives ~= nil then
         task.wait(0.1)
+        local result = type(pickedPassives) == "table" and pickedPassives[Feature.autoPassiveSlot] or nil
+        return true, tostring(result or "")
+    end
+
+    local beforeKey = tostring(before or "")
+    local fallbackDeadline = os.clock() + 0.75
+    while os.clock() < fallbackDeadline do
+        if not alive() or not Feature.autoPassiveEnabled then
+            return true, tostring(before or "")
+        end
+        task.wait(0.05)
         local _, current = AutoPassive.getAutoPassiveCurrentValue(uid, Feature.autoPassiveSlot)
         if current ~= nil and tostring(current) ~= beforeKey then
             return true, tostring(current)
-        end
-        if not alive() or not Feature.autoPassiveEnabled then
-            break
         end
     end
     local _, current = AutoPassive.getAutoPassiveCurrentValue(uid, Feature.autoPassiveSlot)
@@ -2059,21 +2100,19 @@ function AutoPassive.startAutoPassive()
                 break
             end
 
-            local pending = #jobs
             for _, jobData in ipairs(jobs) do
-                task.spawn(function()
-                    local ok, result = AutoPassive.autoPassiveRollOne(jobData.uid, jobData.cost)
-                    if not ok then
-                        Feature.autoPassiveLastMessage = "Loi UID:" .. tostring(jobData.uid) .. " " .. tostring(result)
-                    end
-                    pending = pending - 1
-                end)
+                if not alive() or not Feature.autoPassiveEnabled or runToken ~= Feature.autoPassiveRunToken then
+                    break
+                end
+                local ok, result = AutoPassive.autoPassiveRollOne(jobData.uid, jobData.cost)
+                if not ok then
+                    Feature.autoPassiveLastMessage = "Loi UID:" .. tostring(jobData.uid) .. " " .. tostring(result)
+                    Feature.updateAutoPassiveStatus()
+                end
+                if Feature.autoPassiveEnabled and runToken == Feature.autoPassiveRunToken then
+                    task.wait(Feature.autoPassiveRollDelay)
+                end
             end
-            while pending > 0 and alive() and Feature.autoPassiveEnabled and runToken == Feature.autoPassiveRunToken do
-                Feature.updateAutoPassiveStatus()
-                task.wait(0.1)
-            end
-            task.wait(Feature.autoPassiveRollDelay)
         end
         Feature.autoPassiveBusy = false
         Feature.updateAutoPassiveStatus()
@@ -3155,14 +3194,23 @@ function DungeonFarm.flyTo(targetPart, token)
     local flySpeed = DungeonFarm.normalizeFlySpeed(DungeonFarm.flySpeed)
     DungeonFarm.teleportDistance = teleportDistance
     DungeonFarm.flySpeed = flySpeed
+    local orientation = root.CFrame - root.Position
 
-    if distance <= teleportDistance then
-        local orientation = root.CFrame - root.Position
-        root.CFrame = CFrame.new(target) * orientation
-        pcall(function()
+    local function placeCharacter(position)
+        local nextCFrame = CFrame.new(position) * orientation
+        local ok = pcall(function()
+            character:PivotTo(nextCFrame)
+            root.CFrame = nextCFrame
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
         end)
+        return ok
+    end
+
+    if distance <= teleportDistance then
+        if not placeCharacter(target) then
+            return false
+        end
         task.wait(0.08)
         return root.Parent and (root.Position - target).Magnitude <= 14
     end
@@ -3179,15 +3227,17 @@ function DungeonFarm.flyTo(targetPart, token)
     local oldAnchored = root.Anchored
     local oldAutoRotate = humanoid and humanoid.AutoRotate
     local oldPlatformStand = humanoid and humanoid.PlatformStand
-    local oldOrientation = root.CFrame - root.Position
     root.Anchored = true
     if humanoid then
         humanoid.AutoRotate = false
         humanoid.PlatformStand = true
     end
 
-    local deadline = os.clock() + 35
+    local travelBudget = math.max(35, distance / math.max(flySpeed, 40) * 2.5 + 8)
+    local deadline = os.clock() + math.clamp(travelBudget, 35, 120)
     local reached = true
+    local stalledSince = nil
+    local lastDistance = distance
 
     while root.Parent and (root.Position - target).Magnitude > 8 do
         if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
@@ -3198,6 +3248,10 @@ function DungeonFarm.flyTo(targetPart, token)
             reached = false
             break
         end
+        if not targetPart.Parent then
+            reached = false
+            break
+        end
 
         local delta = target - root.Position
         local distance = delta.Magnitude
@@ -3205,22 +3259,31 @@ function DungeonFarm.flyTo(targetPart, token)
         if distance <= 0 then
             break
         end
-        root.CFrame = CFrame.new(root.Position + delta.Unit * step) * oldOrientation
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end)
+        local previousPosition = root.Position
+        if not placeCharacter(previousPosition + delta.Unit * step) then
+            reached = false
+            break
+        end
         task.wait(0.05)
+        local remainingDistance = (root.Position - target).Magnitude
+        if remainingDistance < lastDistance - 0.5 then
+            lastDistance = remainingDistance
+            stalledSince = nil
+        else
+            stalledSince = stalledSince or os.clock()
+            if os.clock() - stalledSince >= 2.5 then
+                reached = false
+                break
+            end
+        end
     end
 
     if reached and root.Parent then
-        root.CFrame = CFrame.new(target) * oldOrientation
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end)
+        if not placeCharacter(target) then
+            reached = false
+        end
         task.wait(0.15)
-        reached = (root.Position - target).Magnitude <= 12
+        reached = reached and (root.Position - target).Magnitude <= 12
     end
 
     if humanoid then
@@ -3559,11 +3622,13 @@ function DungeonFarm.start()
                                         string.format("Da clear %d room | Dang cho cot tiep theo...", completedCount)
                                     )
                                     if os.clock() - noPromptSince >= 30 then
-                                        DungeonFarm.phase = "complete"
-                                        DungeonFarm.lastMessage = "Khong con ConfirmPart active."
-                                        DungeonFarm.updateStatus("Dungeon Farm: XONG", "Da clear het room dang mo.")
-                                        notifyStatus("Auto Dungeon", "Da clear het room dang mo, cho game bao ket thuc.")
-                                        return
+                                        DungeonFarm.phase = "waiting_map"
+                                        DungeonFarm.lastMessage = "Chua thay ConfirmPart moi; tiep tuc quet map."
+                                        DungeonFarm.updateStatus(
+                                            "Dungeon Farm: CHO MAP",
+                                            DungeonFarm.lastMessage
+                                        )
+                                        noPromptSince = os.clock()
                                     end
                                 else
                                     DungeonFarm.phase = "waiting"
