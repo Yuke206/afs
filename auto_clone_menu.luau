@@ -400,6 +400,7 @@ local DungeonFarm = {
     toggleUpdating = false,
     token = 0,
     running = false,
+    entered = false,
     phase = "idle",
     room = nil,
     targetRoom = nil,
@@ -3098,14 +3099,33 @@ function DungeonFarm.enemyCount(dungeon)
     return enemies and #enemies:GetChildren() or 0
 end
 
-function DungeonFarm.flyTo(part, token)
+function DungeonFarm.getTargetPosition(target)
+    if not target or not target.Parent then
+        return nil
+    end
+    if target:IsA("BasePart") then
+        return target.Position
+    end
+    if target:IsA("Model") then
+        local ok, pivot = pcall(function()
+            return target:GetPivot()
+        end)
+        if ok and pivot then
+            return pivot.Position
+        end
+    end
+    return nil
+end
+
+function DungeonFarm.flyTo(targetPart, token)
     local character = LocalPlayer.Character
     local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
-    if not (character and root and part and part.Parent) then
+    local targetPosition = DungeonFarm.getTargetPosition(targetPart)
+    if not (character and root and targetPart and targetPosition) then
         return false
     end
 
-    local target = part.Position + Vector3.new(0, 3, 0)
+    local target = targetPosition + Vector3.new(0, 3, 0)
     local distance = (root.Position - target).Magnitude
     local teleportDistance = DungeonFarm.normalizeTeleportDistance(DungeonFarm.teleportDistance)
     local flySpeed = DungeonFarm.normalizeFlySpeed(DungeonFarm.flySpeed)
@@ -3203,7 +3223,6 @@ function DungeonFarm.clearEnemies(dungeon, token)
     end
 
     local deadline = os.clock() + 180
-    local lastSend = 0
     while enemies.Parent and #enemies:GetChildren() > 0 do
         if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
             return false, "Da dung dungeon farm."
@@ -3215,18 +3234,34 @@ function DungeonFarm.clearEnemies(dungeon, token)
             return false, "Combat qua lau, het thoi gian cho room."
         end
 
-        if os.clock() - lastSend >= 1 then
-            for _, enemy in ipairs(enemies:GetChildren()) do
-                if enemy:IsA("Model") and enemy.Parent == enemies then
+        local enemyList = enemies:GetChildren()
+        local sentAny = false
+        for index, enemy in ipairs(enemyList) do
+            if enemy:IsA("Model") and enemy.Parent == enemies then
+                DungeonFarm.updateStatus(
+                    "Dungeon Farm: COMBAT",
+                    string.format(
+                        "Room %s | Dang toi quai %d/%d | Con %d enemy",
+                        tostring(DungeonFarm.room or "?"),
+                        index,
+                        #enemyList,
+                        #enemies:GetChildren()
+                    )
+                )
+                if not DungeonFarm.flyTo(enemy, token) then
+                    return false, "Fly toi enemy " .. tostring(enemy.Name) .. " that bai."
+                end
+                if enemy.Parent == enemies then
                     local ok, err = pcall(function()
                         sendEvent:Fire(enemy, true, true)
                     end)
                     if not ok then
                         return false, "Gui pet loi: " .. tostring(err)
                     end
+                    sentAny = true
+                    task.wait(0.12)
                 end
             end
-            lastSend = os.clock()
         end
 
         DungeonFarm.lastEnemyCount = #enemies:GetChildren()
@@ -3234,7 +3269,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
             "Dungeon Farm: COMBAT",
             string.format("Room %s | Con %d enemy", tostring(DungeonFarm.room or "?"), DungeonFarm.lastEnemyCount)
         )
-        task.wait(0.5)
+        task.wait(sentAny and 0.45 or 0.5)
     end
 
     DungeonFarm.lastEnemyCount = 0
@@ -3357,7 +3392,7 @@ function DungeonFarm.start()
     if not DungeonFarm.enabled or not dungeonActive then
         return
     end
-    if DungeonFarm.running then
+    if not DungeonFarm.entered or DungeonFarm.running then
         return
     end
 
@@ -3470,20 +3505,11 @@ function DungeonFarm.start()
 
                                 DungeonFarm.phase = "activating"
                                 DungeonFarm.activationAt = os.clock()
-                                local activated, activationError = pcall(function()
-                                    if type(fireproximityprompt) ~= "function" then
-                                        error("fireproximityprompt khong ton tai trong executor.")
-                                    end
-                                    fireproximityprompt(prompt)
-                                end)
-                                if not activated then
-                                    DungeonFarm.fail("Instant interaction loi: " .. tostring(activationError), token)
-                                    return
-                                end
-
                                 local transitioned = false
                                 local promptGoneAt = nil
                                 local deadline = os.clock() + 35
+                                local lastActivation = 0
+                                local activationAttempts = 0
                                 while alive() and dungeonActive and DungeonFarm.enabled and token == DungeonFarm.token do
                                     if enemies and #enemies:GetChildren() > 0 then
                                         transitioned = true
@@ -3497,6 +3523,41 @@ function DungeonFarm.start()
                                         end
                                     else
                                         promptGoneAt = nil
+                                    end
+                                    if prompt.Parent and prompt.Enabled
+                                        and os.clock() - lastActivation >= 0.75 then
+                                        activationAttempts = activationAttempts + 1
+                                        if activationAttempts > 6 then
+                                            break
+                                        end
+                                        if activationAttempts > 1 then
+                                            DungeonFarm.updateStatus(
+                                                "Dungeon Farm: ACTIVE LAI",
+                                                string.format(
+                                                    "Room %s | Cot van con bat, thu lai lan %d/6",
+                                                    tostring(room.Name),
+                                                    activationAttempts
+                                                )
+                                            )
+                                            if not DungeonFarm.flyTo(part, token) then
+                                                DungeonFarm.fail(
+                                                    "Fly lai toi cot " .. tostring(room.Name) .. " that bai.",
+                                                    token
+                                                )
+                                                return
+                                            end
+                                        end
+                                        local activated, activationError = pcall(function()
+                                            if type(fireproximityprompt) ~= "function" then
+                                                error("fireproximityprompt khong ton tai trong executor.")
+                                            end
+                                            fireproximityprompt(prompt)
+                                        end)
+                                        if not activated then
+                                            DungeonFarm.fail("Instant interaction loi: " .. tostring(activationError), token)
+                                            return
+                                        end
+                                        lastActivation = os.clock()
                                     end
                                     if os.clock() >= deadline then
                                         break
@@ -3546,6 +3607,7 @@ local function restoreDungeonSession(reason)
     Feature.autoDungeonEnabled = false
     DungeonFarm.token = DungeonFarm.token + 1
     DungeonFarm.running = false
+    DungeonFarm.entered = false
     DungeonFarm.phase = "idle"
     DungeonFarm.room = nil
     DungeonFarm.targetRoom = nil
@@ -3618,6 +3680,16 @@ end
 DungeonFarm.restore = restoreDungeonSession
 
 local function startAutoDungeon()
+    if tostring(getPlayerValue("World", "")) == "Dungeon" then
+        dungeonActive = true
+        DungeonFarm.entered = true
+        if DungeonFarm.enabled then
+            DungeonFarm.start()
+        else
+            DungeonFarm.updateStatus("Dungeon Farm: TAT", "Farm dungeon dang tat.")
+        end
+        return
+    end
     if dungeonActive or dungeonWaiting then
         return
     end
@@ -3669,6 +3741,7 @@ local function startAutoDungeon()
     dungeonActive = true
     DungeonFarm.token = DungeonFarm.token + 1
     DungeonFarm.running = false
+    DungeonFarm.entered = false
     DungeonFarm.phase = "starting"
     DungeonFarm.room = nil
     DungeonFarm.targetRoom = nil
@@ -3717,11 +3790,16 @@ local function startAutoDungeon()
     end)
 
     task.spawn(function()
-        for _ = 1, 80 do
+        local lastTravelAttempt = os.clock()
+        for _ = 1, 240 do
+            if not alive() or not dungeonActive then
+                return
+            end
             local checkOK, arrived = protectedCall("Check dungeon travel", function()
                 return tostring(getPlayerValue("World", "")) == "Dungeon"
             end)
             if checkOK and arrived then
+                DungeonFarm.entered = true
                 notifyStatus("Auto Dungeon", "Da vao dungeon: " .. dungeonSelection.mapId)
                 if DungeonFarm.enabled then
                     DungeonFarm.start()
@@ -3730,11 +3808,26 @@ local function startAutoDungeon()
                 end
                 return
             end
+            if os.clock() - lastTravelAttempt >= 3 then
+                lastTravelAttempt = os.clock()
+                protectedCall("Retry travel to dungeon", function()
+                    local travelEvent = Bindable:FindFirstChild("AttemptTravel")
+                    if travelEvent then
+                        travelEvent:Fire("Dungeon")
+                    end
+                end)
+            end
             task.wait(0.25)
         end
-        protectedCall("Restore failed dungeon", function()
-            restoreDungeonSession("Khong vao duoc dungeon")
-        end)
+        if alive() and dungeonActive and not DungeonFarm.entered then
+            DungeonFarm.phase = "waiting_entry"
+            DungeonFarm.lastMessage = "Dungeon da mo; dang cho vao dungeon thu cong."
+            DungeonFarm.updateStatus(
+                "Dungeon Farm: CHO VAO",
+                "Teleport tu dong loi. Hay vao Dungeon thu cong; farm se tu dong chay."
+            )
+            notifyStatus("Auto Dungeon", "Dungeon da mo nhung teleport loi; vao Dungeon thu cong de farm tiep.")
+        end
     end)
 end
 
@@ -3742,9 +3835,18 @@ dungeonFinishConnection = DungeonFinish.OnClientEvent:Connect(function()
     if alive() and dungeonActive then
         task.delay(1, function()
             if alive() and dungeonActive then
-                protectedCall("Restore completed dungeon", function()
-                    restoreDungeonSession("Dungeon da hoan tat")
-                end)
+                if dungeonSession then
+                    protectedCall("Restore completed dungeon", function()
+                        restoreDungeonSession("Dungeon da hoan tat")
+                    end)
+                else
+                    DungeonFarm.token = DungeonFarm.token + 1
+                    DungeonFarm.running = false
+                    DungeonFarm.entered = false
+                    dungeonActive = false
+                    DungeonFarm.phase = "idle"
+                    DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Dungeon da hoan tat.")
+                end
             end
         end)
     end
@@ -3754,22 +3856,35 @@ local worldValue = LocalPlayer:FindFirstChild("World") or LocalPlayer:WaitForChi
 local dungeonWorldConnection
 if worldValue then
     dungeonWorldConnection = worldValue.Changed:Connect(function(value)
-        if alive() and dungeonActive and tostring(value) == "Dungeon" and DungeonFarm.enabled then
-            task.delay(0.5, function()
-                if alive()
-                    and dungeonActive
-                    and DungeonFarm.enabled
-                    and tostring(getPlayerValue("World", "")) == "Dungeon"
-                    and not DungeonFarm.running then
-                    DungeonFarm.start()
-                end
-            end)
-        elseif alive() and dungeonActive and tostring(value) ~= "Dungeon" and dungeonSession then
+        if alive() and tostring(value) == "Dungeon" then
+            dungeonActive = true
+            DungeonFarm.entered = true
+            if DungeonFarm.enabled then
+                task.delay(0.5, function()
+                    if alive()
+                        and dungeonActive
+                        and DungeonFarm.enabled
+                        and tostring(getPlayerValue("World", "")) == "Dungeon"
+                        and not DungeonFarm.running then
+                        DungeonFarm.start()
+                    end
+                end)
+            end
+        elseif alive() and dungeonActive and DungeonFarm.entered and tostring(value) ~= "Dungeon" then
             task.delay(1, function()
                 if alive() and dungeonActive and tostring(getPlayerValue("World", "")) ~= "Dungeon" then
-                    protectedCall("Restore dungeon after travel", function()
-                        restoreDungeonSession("Da roi khoi dungeon")
-                    end)
+                    if dungeonSession then
+                        protectedCall("Restore dungeon after travel", function()
+                            restoreDungeonSession("Da roi khoi dungeon")
+                        end)
+                    else
+                        DungeonFarm.token = DungeonFarm.token + 1
+                        DungeonFarm.running = false
+                        DungeonFarm.entered = false
+                        dungeonActive = false
+                        DungeonFarm.phase = "idle"
+                        DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Da roi khoi dungeon.")
+                    end
                 end
             end)
         end
@@ -4003,7 +4118,12 @@ local function buildDungeonControls()
             DungeonFarm.token = DungeonFarm.token + 1
             if DungeonFarm.enabled and dungeonActive then
                 DungeonFarm.running = false
-                DungeonFarm.start()
+                if DungeonFarm.entered then
+                    DungeonFarm.start()
+                else
+                    DungeonFarm.phase = "waiting_entry"
+                    DungeonFarm.updateStatus("Dungeon Farm: CHO VAO", "Dang cho vao Dungeon...")
+                end
             elseif not DungeonFarm.enabled then
                 DungeonFarm.running = false
                 DungeonFarm.phase = "idle"
@@ -4582,6 +4702,11 @@ local function finishSetup(loadOldConfig)
     protectedCall("Startup machine status", updateMachineStatus)
     protectedCall("Startup dungeon status", updateDungeonCooldownStatus)
     protectedCall("Restore saved feature state", Feature.applySavedState)
+    if tostring(getPlayerValue("World", "")) == "Dungeon" and DungeonFarm.enabled then
+        dungeonActive = true
+        DungeonFarm.entered = true
+        protectedCall("Attach existing dungeon farm", DungeonFarm.start)
+    end
     controlsReady = true
     if not loadOldConfig then
         protectedCall("Startup config save", function()
