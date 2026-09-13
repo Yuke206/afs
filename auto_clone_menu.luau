@@ -316,6 +316,7 @@ local Feature = {
     autoPassiveCurrencyDropdown = nil,
     autoPassiveCategoryDropdown = nil,
     autoPassiveSlotDropdown = nil,
+    autoPassiveRollDelaySlider = nil,
     autoPassiveStatusParagraph = nil,
     autoPassiveSelectedUID = {},
     autoPassiveTargetPassives = {},
@@ -324,6 +325,10 @@ local Feature = {
     autoPassiveCurrency = "token",
     autoPassiveCategory = "",
     autoPassiveSlot = 1,
+    autoPassiveRollDelayMin = 0.1,
+    autoPassiveRollDelayMax = 2,
+    autoPassiveRollDelayDefault = 0.3,
+    autoPassiveRollDelay = 0.3,
     autoPassiveRunToken = 0,
     autoPassiveBusy = false,
     autoPassiveRollCount = 0,
@@ -349,13 +354,19 @@ Feature.passiveRarityOrder = {
     Epic = 3,
     Legendary = 4,
     Mythical = 5,
-    Raid = 6,
-    Secret = 7,
-    Divine = 8,
-    Special = 9,
-    Heavenly = 10,
-    Evolved = 11
+    Secret = 6,
+    Divine = 7
 }
+
+function AutoPassive.normalizeRollDelay(value)
+    local delay = tonumber(value) or Feature.autoPassiveRollDelayDefault
+    if delay < Feature.autoPassiveRollDelayMin then
+        delay = Feature.autoPassiveRollDelayMin
+    elseif delay > Feature.autoPassiveRollDelayMax then
+        delay = Feature.autoPassiveRollDelayMax
+    end
+    return math.floor(delay * 10 + 0.5) / 10
+end
 local lastAction = {}
 local initialLocation
 local travelBusy = false
@@ -382,6 +393,23 @@ local dungeonAvatarDropdown
 local dungeonToggle
 local dungeonToggleUpdating = false
 local dungeonCooldownParagraph
+local dungeonFarmToggle
+local dungeonFarmStatusParagraph
+local DungeonFarm = {
+    enabled = true,
+    toggleUpdating = false,
+    token = 0,
+    phase = "idle",
+    room = nil,
+    targetRoom = nil,
+    targetPart = nil,
+    activationAt = 0,
+    lastEnemyCount = 0,
+    completed = {},
+    attempts = {},
+    startedAt = 0,
+    lastMessage = "Chua chay."
+}
 local dungeonWaiting = false
 local dungeonWaitToken = 0
 local configLoaded = false
@@ -1015,6 +1043,7 @@ local function saveConfig(silent)
             features = {
                 autoClone = autoEnabled,
                 autoDungeon = Feature.autoDungeonEnabled,
+                autoDungeonFarm = DungeonFarm.enabled,
                 autoFarm = Feature.autoFarmEnabled,
                 autoPassive = Feature.autoPassiveEnabled
             },
@@ -1029,7 +1058,8 @@ local function saveConfig(silent)
                 keepMode = Feature.autoPassiveKeepMode,
                 currency = Feature.autoPassiveCurrency,
                 category = Feature.autoPassiveCategory,
-                slot = Feature.autoPassiveSlot
+                slot = Feature.autoPassiveSlot,
+                rollDelay = Feature.autoPassiveRollDelay
             }
         })
         writefile(ConfigPath, encoded)
@@ -1067,6 +1097,7 @@ local function loadConfig()
         Feature.savedFeatureState = {
             autoClone = data.features.autoClone == true,
             autoDungeon = data.features.autoDungeon == true,
+            autoDungeonFarm = data.features.autoDungeonFarm ~= false,
             autoFarm = data.features.autoFarm == true,
             autoPassive = data.features.autoPassive == true
         }
@@ -1156,6 +1187,7 @@ local function loadConfig()
         if slot == 1 or slot == 2 then
             Feature.autoPassiveSlot = slot
         end
+        Feature.autoPassiveRollDelay = AutoPassive.normalizeRollDelay(autoData.rollDelay)
     end
 
     if type(data.dungeonSelection) == "table" then
@@ -1664,11 +1696,18 @@ function AutoPassive.getPassiveRarityName(passiveId)
     return "Common"
 end
 
+function AutoPassive.isPassiveRollable(data)
+    return type(data) == "table"
+        and (tonumber(data.Chance) or 0) > 0
+        and not data.Hidden
+        and not data.Unrollable
+end
+
 function AutoPassive.makeAutoPassiveTargetOptions()
     AutoPassiveMaps.optionToPassive = {}
     local entries = {}
     for id, data in pairs(PassiveStats) do
-        if type(data) == "table" and data.Chance ~= nil and data.Chance > 0 and not data.Hidden and not data.Unrollable then
+        if AutoPassive.isPassiveRollable(data) then
             local display = cleanText(data.DisplayName or data.Name or id)
             local rarity = AutoPassive.getPassiveRarityName(id)
             local option = string.format("%s | %s | %s", display ~= "" and display or id, rarity, id)
@@ -1690,12 +1729,27 @@ function AutoPassive.makeAutoPassiveTargetOptions()
 end
 
 function AutoPassive.makeAutoPassiveRarityOptions()
+    local available = {}
+    for id, data in pairs(PassiveStats) do
+        if AutoPassive.isPassiveRollable(data) then
+            local rarity = AutoPassive.getPassiveRarityName(id)
+            if rarity ~= "Unknown" then
+                available[rarity] = true
+            end
+        end
+    end
+
     local options = {}
-    for rarity, _ in pairs(Feature.passiveRarityOrder) do
+    for rarity in pairs(available) do
         table.insert(options, rarity)
     end
     table.sort(options, function(a, b)
-        return (Feature.passiveRarityOrder[a] or 99) < (Feature.passiveRarityOrder[b] or 99)
+        local orderA = Feature.passiveRarityOrder[a] or 99
+        local orderB = Feature.passiveRarityOrder[b] or 99
+        if orderA == orderB then
+            return a < b
+        end
+        return orderA < orderB
     end)
     return options
 end
@@ -1858,13 +1912,14 @@ Feature.updateAutoPassiveStatus = function()
     end
     local currency = Feature.autoPassiveCurrency == "shard" and "Shard" or "PassiveToken"
     local desc = string.format(
-        "Pet: %d | Slot: %d | Giu %s: %s | Currency: %s | Roll: %d | %s",
+        "Pet: %d | Slot: %d | Giu %s: %s | Currency: %s | Roll: %d | Delay: %.1fs | %s",
         selected,
         Feature.autoPassiveSlot,
         Feature.autoPassiveKeepMode == "rarity" and "quality" or "passive",
         target,
         currency,
         Feature.autoPassiveRollCount,
+        Feature.autoPassiveRollDelay,
         Feature.autoPassiveLastMessage
     )
     setParagraph(
@@ -1997,7 +2052,7 @@ function AutoPassive.startAutoPassive()
                 Feature.updateAutoPassiveStatus()
                 task.wait(0.1)
             end
-            task.wait(0.3)
+            task.wait(Feature.autoPassiveRollDelay)
         end
         Feature.autoPassiveBusy = false
         Feature.updateAutoPassiveStatus()
@@ -2844,6 +2899,336 @@ local function updateDungeonCooldownStatus()
     setParagraph(dungeonCooldownParagraph, title, desc)
 end
 
+function DungeonFarm.updateStatus(title, desc)
+    if dungeonFarmStatusParagraph then
+        setParagraph(dungeonFarmStatusParagraph, title, desc)
+    end
+end
+
+function DungeonFarm.getDungeon()
+    if tostring(getPlayerValue("World", "")) ~= "Dungeon" then
+        return nil
+    end
+    local worlds = workspace:FindFirstChild("Worlds")
+    return worlds and worlds:FindFirstChild("Dungeon")
+end
+
+function DungeonFarm.findPrompt(dungeon)
+    local map = dungeon and dungeon:FindFirstChild("Map")
+    if not map then
+        return nil
+    end
+
+    for _, object in ipairs(map:GetDescendants()) do
+        if object:IsA("ProximityPrompt") and object.Enabled then
+            local part = object.Parent
+            local room = part and part.Parent
+            if part and part.Name == "ConfirmPart"
+                and room and room:IsA("Model")
+                and room:GetAttribute("MapPos") ~= nil then
+                local key = room:GetFullName()
+                if not DungeonFarm.completed[key] then
+                    return object, room, part, key
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function DungeonFarm.enemyCount(dungeon)
+    local enemies = dungeon and dungeon:FindFirstChild("Enemies")
+    return enemies and #enemies:GetChildren() or 0
+end
+
+function DungeonFarm.flyTo(part, token)
+    local character = LocalPlayer.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not (character and root and part and part.Parent) then
+        return false
+    end
+
+    local collisionState = {}
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("BasePart") then
+            collisionState[object] = object.CanCollide
+            object.CanCollide = false
+        end
+    end
+
+    local target = part.Position + Vector3.new(0, 3, 0)
+    local deadline = os.clock() + 35
+    local reached = true
+
+    while root.Parent and (root.Position - target).Magnitude > 8 do
+        if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
+            reached = false
+            break
+        end
+        if os.clock() >= deadline then
+            reached = false
+            break
+        end
+
+        local delta = target - root.Position
+        local distance = delta.Magnitude
+        local step = math.min(10, distance)
+        if distance <= 0 then
+            break
+        end
+        root.CFrame = CFrame.new(root.Position + delta.Unit * step)
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+        end)
+        task.wait(0.08)
+    end
+
+    if reached and root.Parent then
+        root.CFrame = CFrame.new(target)
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+        end)
+        task.wait(0.15)
+        reached = (root.Position - target).Magnitude <= 12
+    end
+
+    for object, canCollide in pairs(collisionState) do
+        if object.Parent then
+            object.CanCollide = canCollide
+        end
+    end
+    return reached
+end
+
+function DungeonFarm.clearEnemies(dungeon, token)
+    local enemies = dungeon and dungeon:FindFirstChild("Enemies")
+    local sendEvent = Bindable:FindFirstChild("SendPet")
+    if not enemies then
+        return false, "Khong tim thay folder Enemies."
+    end
+    if not sendEvent then
+        return false, "Bindable.SendPet khong ton tai."
+    end
+
+    local deadline = os.clock() + 180
+    local lastSend = 0
+    while enemies.Parent and #enemies:GetChildren() > 0 do
+        if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
+            return false, "Da dung dungeon farm."
+        end
+        if tostring(getPlayerValue("World", "")) ~= "Dungeon" then
+            return false, "Da roi khoi dungeon."
+        end
+        if os.clock() >= deadline then
+            return false, "Combat qua lau, het thoi gian cho room."
+        end
+
+        if os.clock() - lastSend >= 1 then
+            for _, enemy in ipairs(enemies:GetChildren()) do
+                if enemy:IsA("Model") and enemy.Parent == enemies then
+                    local ok, err = pcall(function()
+                        sendEvent:Fire(enemy, true, true)
+                    end)
+                    if not ok then
+                        return false, "Gui pet loi: " .. tostring(err)
+                    end
+                end
+            end
+            lastSend = os.clock()
+        end
+
+        DungeonFarm.lastEnemyCount = #enemies:GetChildren()
+        DungeonFarm.updateStatus(
+            "Dungeon Farm: COMBAT",
+            string.format("Room %s | Con %d enemy", tostring(DungeonFarm.room or "?"), DungeonFarm.lastEnemyCount)
+        )
+        task.wait(0.5)
+    end
+
+    DungeonFarm.lastEnemyCount = 0
+    return true, "Da clear enemy."
+end
+
+function DungeonFarm.fail(reason, token)
+    if token and token ~= DungeonFarm.token then
+        return
+    end
+    DungeonFarm.phase = "error"
+    DungeonFarm.lastMessage = tostring(reason)
+    DungeonFarm.updateStatus("Dungeon Farm: LOI", tostring(reason))
+    notifyStatus("Auto Dungeon", "Dungeon farm loi: " .. tostring(reason))
+    Feature.autoDungeonEnabled = false
+    if dungeonToggle then
+        dungeonToggleUpdating = true
+        pcall(function()
+            dungeonToggle:Set(false)
+        end)
+        dungeonToggleUpdating = false
+    end
+    saveConfig(true)
+    if DungeonFarm.restore then
+        task.spawn(function()
+            protectedCall("Restore failed dungeon farm", function()
+                DungeonFarm.restore("Dungeon farm loi: " .. tostring(reason))
+            end)
+        end)
+    end
+end
+
+function DungeonFarm.start()
+    if not DungeonFarm.enabled or not dungeonActive then
+        return
+    end
+    if DungeonFarm.phase == "searching"
+        or DungeonFarm.phase == "flying"
+        or DungeonFarm.phase == "activating"
+        or DungeonFarm.phase == "combat" then
+        return
+    end
+
+    DungeonFarm.token = DungeonFarm.token + 1
+    local token = DungeonFarm.token
+    DungeonFarm.phase = "searching"
+    DungeonFarm.room = nil
+    DungeonFarm.targetRoom = nil
+    DungeonFarm.targetPart = nil
+    DungeonFarm.activationAt = 0
+    DungeonFarm.lastEnemyCount = 0
+    DungeonFarm.completed = {}
+    DungeonFarm.attempts = {}
+    DungeonFarm.startedAt = os.clock()
+    DungeonFarm.lastMessage = "Dang tim ConfirmPart active."
+
+    task.spawn(function()
+        local noPromptSince = 0
+        while alive() and dungeonActive and DungeonFarm.enabled and token == DungeonFarm.token do
+            if tostring(getPlayerValue("World", "")) ~= "Dungeon" then
+                return
+            end
+
+            local dungeon = DungeonFarm.getDungeon()
+            if not dungeon then
+                DungeonFarm.phase = "waiting"
+                DungeonFarm.updateStatus("Dungeon Farm: CHO", "Dang cho map Dungeon load...")
+                task.wait(0.5)
+            else
+                local enemies = dungeon:FindFirstChild("Enemies")
+                if enemies and #enemies:GetChildren() > 0 then
+                    DungeonFarm.phase = "combat"
+                    local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
+                    if not ok then
+                        DungeonFarm.fail(reason, token)
+                        return
+                    end
+                    noPromptSince = 0
+                else
+                    local prompt, room, part, key = DungeonFarm.findPrompt(dungeon)
+                    if not prompt then
+                        local completedCount = 0
+                        for _ in pairs(DungeonFarm.completed) do
+                            completedCount = completedCount + 1
+                        end
+                        if completedCount > 0 then
+                            noPromptSince = noPromptSince == 0 and os.clock() or noPromptSince
+                            DungeonFarm.phase = "waiting"
+                            DungeonFarm.updateStatus(
+                                "Dungeon Farm: CHO ROOM",
+                                string.format("Da clear %d room | Dang cho cot tiep theo...", completedCount)
+                            )
+                            if os.clock() - noPromptSince >= 30 then
+                                DungeonFarm.phase = "complete"
+                                DungeonFarm.lastMessage = "Khong con ConfirmPart active."
+                                DungeonFarm.updateStatus("Dungeon Farm: XONG", "Da clear het room dang mo.")
+                                notifyStatus("Auto Dungeon", "Da clear het room dang mo, cho game bao ket thuc.")
+                                return
+                            end
+                        else
+                            DungeonFarm.phase = "waiting"
+                            DungeonFarm.updateStatus("Dungeon Farm: CHO", "Dang cho ConfirmPart dau tien...")
+                        end
+                        task.wait(0.5)
+                    else
+                        noPromptSince = 0
+                        DungeonFarm.targetRoom = room
+                        DungeonFarm.targetPart = part
+                        DungeonFarm.room = room.Name
+                        local attempts = (DungeonFarm.attempts[key] or 0) + 1
+                        DungeonFarm.attempts[key] = attempts
+                        if attempts > 3 then
+                            DungeonFarm.fail("Khong active duoc room " .. tostring(room.Name) .. ".", token)
+                            return
+                        end
+
+                        DungeonFarm.phase = "flying"
+                        DungeonFarm.updateStatus("Dungeon Farm: FLY", "Dang bay noclip toi room " .. tostring(room.Name) .. "...")
+                        if not DungeonFarm.flyTo(part, token) then
+                            DungeonFarm.fail("Fly toi room " .. tostring(room.Name) .. " that bai.", token)
+                            return
+                        end
+
+                        DungeonFarm.phase = "activating"
+                        DungeonFarm.activationAt = os.clock()
+                        local activated, activationError = pcall(function()
+                            if type(fireproximityprompt) ~= "function" then
+                                error("fireproximityprompt khong ton tai trong executor.")
+                            end
+                            fireproximityprompt(prompt)
+                        end)
+                        if not activated then
+                            DungeonFarm.fail("Instant interaction loi: " .. tostring(activationError), token)
+                            return
+                        end
+
+                        local transitioned = false
+                        local promptGoneAt = nil
+                        local deadline = os.clock() + 35
+                        while alive() and dungeonActive and DungeonFarm.enabled and token == DungeonFarm.token do
+                            if enemies and #enemies:GetChildren() > 0 then
+                                transitioned = true
+                                break
+                            end
+                            if not prompt.Parent or not prompt.Enabled then
+                                promptGoneAt = promptGoneAt or os.clock()
+                                if os.clock() - promptGoneAt >= 2 then
+                                    transitioned = true
+                                    break
+                                end
+                            else
+                                promptGoneAt = nil
+                            end
+                            if os.clock() >= deadline then
+                                break
+                            end
+                            task.wait(0.25)
+                        end
+
+                        if not transitioned then
+                            DungeonFarm.fail("Room " .. tostring(room.Name) .. " khong doi trang thai sau khi active.", token)
+                            return
+                        end
+
+                        if enemies and #enemies:GetChildren() > 0 then
+                            DungeonFarm.phase = "combat"
+                            local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
+                            if not ok then
+                                DungeonFarm.fail(reason, token)
+                                return
+                            end
+                        end
+
+                        DungeonFarm.completed[key] = true
+                        DungeonFarm.attempts[key] = nil
+                        DungeonFarm.lastMessage = "Da clear room " .. tostring(room.Name) .. "."
+                        DungeonFarm.phase = "waiting"
+                        DungeonFarm.updateStatus("Dungeon Farm: DA CLEAR", DungeonFarm.lastMessage)
+                        task.wait(0.5)
+                    end
+                end
+            end
+        end
+    end)
+end
+
 local function restoreDungeonSession(reason)
     local session = dungeonSession
     if not session or session.restoring then
@@ -2852,6 +3237,17 @@ local function restoreDungeonSession(reason)
     session.restoring = true
     dungeonActive = false
     Feature.autoDungeonEnabled = false
+    DungeonFarm.token = DungeonFarm.token + 1
+    DungeonFarm.phase = "idle"
+    DungeonFarm.room = nil
+    DungeonFarm.targetRoom = nil
+    DungeonFarm.targetPart = nil
+    DungeonFarm.activationAt = 0
+    DungeonFarm.lastEnemyCount = 0
+    DungeonFarm.completed = {}
+    DungeonFarm.attempts = {}
+    DungeonFarm.lastMessage = reason or "Da khoi phuc cau hinh"
+    DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", DungeonFarm.lastMessage)
     dungeonWaiting = false
     dungeonWaitToken = dungeonWaitToken + 1
     if dungeonToggle then
@@ -2908,6 +3304,8 @@ local function restoreDungeonSession(reason)
     end)
 end
 
+DungeonFarm.restore = restoreDungeonSession
+
 local function startAutoDungeon()
     if dungeonActive or dungeonWaiting then
         return
@@ -2958,6 +3356,17 @@ local function startAutoDungeon()
         dungeonSettings = getStoreTable("DungeonSettings", true)
     }
     dungeonActive = true
+    DungeonFarm.token = DungeonFarm.token + 1
+    DungeonFarm.phase = "starting"
+    DungeonFarm.room = nil
+    DungeonFarm.targetRoom = nil
+    DungeonFarm.targetPart = nil
+    DungeonFarm.lastEnemyCount = 0
+    DungeonFarm.completed = {}
+    DungeonFarm.attempts = {}
+    DungeonFarm.startedAt = os.clock()
+    DungeonFarm.lastMessage = "Dang tao dungeon..."
+    DungeonFarm.updateStatus("Dungeon Farm: START", DungeonFarm.lastMessage)
 
     applyDungeonTeam(dungeonSelection.teamIndex)
     applyDungeonTitle(dungeonSelection.title)
@@ -2992,6 +3401,11 @@ local function startAutoDungeon()
             end)
             if checkOK and arrived then
                 notifyStatus("Auto Dungeon", "Da vao dungeon: " .. dungeonSelection.mapId)
+                if DungeonFarm.enabled then
+                    DungeonFarm.start()
+                else
+                    DungeonFarm.updateStatus("Dungeon Farm: TAT", "Farm dungeon dang tat.")
+                end
                 return
             end
             task.wait(0.25)
@@ -3208,6 +3622,31 @@ local function buildDungeonControls()
             saveConfig(true)
         end
     })
+
+    dungeonFarmStatusParagraph = DungeonTab:Button({
+        Title = "Dungeon Farm: SAN SANG",
+        Desc = "Dung fly noclip + instant interaction de mo room.",
+        Callback = function() end
+    })
+    dungeonFarmToggle = DungeonTab:Toggle({
+        Title = "Bat Instant Dungeon Farm",
+        Desc = "Bay noclip toi ConfirmPart, active, clear enemy roi lap lai.",
+        Value = DungeonFarm.enabled,
+        Callback = function(value)
+            if DungeonFarm.toggleUpdating or Feature.restoringFeatureState then
+                return
+            end
+            DungeonFarm.enabled = value == true
+            DungeonFarm.token = DungeonFarm.token + 1
+            if DungeonFarm.enabled and dungeonActive then
+                DungeonFarm.start()
+            elseif not DungeonFarm.enabled then
+                DungeonFarm.phase = "idle"
+                DungeonFarm.updateStatus("Dungeon Farm: TAT", "Farm dungeon dang tat.")
+            end
+            saveConfig(true)
+        end
+    })
 end
 
 function AutoPassive.collectPlainDropdownValues(value)
@@ -3333,6 +3772,23 @@ function AutoPassive.buildAutoPassiveControls()
         Callback = function(value)
             if configApplying or dropdownSyncing then return end
             Feature.autoPassiveSlot = value == "Slot 2" and 2 or 1
+            Feature.updateAutoPassiveStatus()
+            saveConfig(true)
+        end
+    })
+
+    Feature.autoPassiveRollDelaySlider = AutoPassiveTab:Slider({
+        Title = "Toc do roll passive",
+        Desc = "Khoang cach giua cac dot roll, mac dinh 0.3 giay.",
+        Value = {
+            Min = Feature.autoPassiveRollDelayMin,
+            Max = Feature.autoPassiveRollDelayMax,
+            Default = Feature.autoPassiveRollDelay
+        },
+        Step = 0.1,
+        Callback = function(value)
+            if configApplying or dropdownSyncing then return end
+            Feature.autoPassiveRollDelay = AutoPassive.normalizeRollDelay(value)
             Feature.updateAutoPassiveStatus()
             saveConfig(true)
         end
@@ -3604,6 +4060,9 @@ Feature.syncAutoPassiveControls = function()
         end
         Feature.autoPassiveCategoryDropdown:Select(categoryOption)
         Feature.autoPassiveSlotDropdown:Select(Feature.autoPassiveSlot == 2 and "Slot 2" or "Slot 1")
+        if Feature.autoPassiveRollDelaySlider then
+            Feature.autoPassiveRollDelaySlider:Set(Feature.autoPassiveRollDelay)
+        end
     end)
     Feature.updateAutoPassiveStatus()
 end
@@ -3623,6 +4082,13 @@ syncDungeonControls = function()
     pcall(function()
         dungeonModeDropdown:Select(dungeonSelection.mode == "Friends" and "Friends" or "Public")
     end)
+    if dungeonFarmToggle then
+        DungeonFarm.toggleUpdating = true
+        pcall(function()
+            dungeonFarmToggle:Set(DungeonFarm.enabled)
+        end)
+        DungeonFarm.toggleUpdating = false
+    end
 end
 
 Feature.syncControls = function()
@@ -3651,6 +4117,14 @@ end
 Feature.applySavedState = function()
     local desired = type(Feature.savedFeatureState) == "table" and Feature.savedFeatureState or {}
     Feature.restoringFeatureState = true
+    DungeonFarm.enabled = desired.autoDungeonFarm ~= false
+    if dungeonFarmToggle then
+        DungeonFarm.toggleUpdating = true
+        pcall(function()
+            dungeonFarmToggle:Set(DungeonFarm.enabled)
+        end)
+        DungeonFarm.toggleUpdating = false
+    end
     autoEnabled = false
     Feature.autoFarmEnabled = false
     Feature.autoDungeonEnabled = false
