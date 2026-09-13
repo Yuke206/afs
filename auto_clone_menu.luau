@@ -421,12 +421,12 @@ local DungeonFarm = {
 
 function DungeonFarm.normalizeTeleportDistance(value)
     local distance = tonumber(value) or 120
-    return math.clamp(math.floor(distance / 10 + 0.5) * 10, 25, 300)
+    return math.clamp(math.floor(distance / 10 + 0.5) * 10, 25, 1000)
 end
 
 function DungeonFarm.normalizeFlySpeed(value)
     local speed = tonumber(value) or 140
-    return math.clamp(math.floor(speed / 10 + 0.5) * 10, 40, 300)
+    return math.clamp(math.floor(speed / 10 + 0.5) * 10, 40, 1000)
 end
 local dungeonWaiting = false
 local dungeonWaitToken = 0
@@ -2724,7 +2724,7 @@ local function makeDungeonWorldOptions()
     local discovered = getStoreTable("DiscoveredWorlds", true)
     for id, data in pairs(WorldData) do
         if type(data) == "table"
-            and discovered[id]
+            and (discovered[id] or data.EventWorld == true)
             and data.BaseLevel
             and data.BaseLevel ~= 0
             and not data.Hidden
@@ -2732,7 +2732,8 @@ local function makeDungeonWorldOptions()
             table.insert(entries, {
                 id = id,
                 name = data.DisplayName or id,
-                level = data.BaseLevel
+                level = data.BaseLevel,
+                event = data.EventWorld == true
             })
         end
     end
@@ -2741,7 +2742,8 @@ local function makeDungeonWorldOptions()
         table.insert(entries, {
             id = dungeonSelection.mapId,
             name = data.DisplayName or dungeonSelection.mapId,
-            level = data.BaseLevel or 0
+            level = data.BaseLevel or 0,
+            event = data.EventWorld == true
         })
     end
     table.sort(entries, function(a, b)
@@ -2752,7 +2754,8 @@ local function makeDungeonWorldOptions()
     end)
     local options = {}
     for _, entry in ipairs(entries) do
-        table.insert(options, string.format("%s [%s]", entry.name, entry.id))
+        local prefix = entry.event and "[EVENT] " or ""
+        table.insert(options, string.format("%s%s [%s]", prefix, entry.name, entry.id))
     end
     return options
 end
@@ -2823,34 +2826,92 @@ local function applyEquippedPets(desired)
     local localData = getStoreTable("EquippedPets")
     desired = type(desired) == "table" and desired or {}
 
+    if amount < 1 then
+        return false, "Khong doc duoc so slot equip hien tai."
+    end
+
+    local target = {}
     for slot = 1, amount do
-        local key = tostring(slot)
-        local oldUID = current[key] or current[slot]
-        local newUID = desired and (desired[key] or desired[slot]) or nil
-        if tostring(oldUID or "") ~= tostring(newUID or "") then
-            if oldUID then
-                protectedCall("Unequip pet", function()
-                    ManagePet:FireServer(oldUID, "Unequip")
-                end)
-            end
-            if newUID then
-                protectedCall("Equip pet", function()
-                    ManagePet:FireServer(newUID, "Equip", slot)
-                end)
-            end
-            localData[key] = newUID or nil
+        local uid = desired[tostring(slot)] or desired[slot]
+        if uid ~= nil and tostring(uid) ~= "" then
+            target[slot] = uid
         end
     end
-    setStoreValue("EquippedPets", localData, 1)
+
+    local function slotValue(data, slot)
+        return data[tostring(slot)] or data[slot]
+    end
+
+    local function matchesTarget()
+        local actual = getStoreTable("EquippedPets", true)
+        for slot = 1, amount do
+            if tostring(slotValue(actual, slot) or "") ~= tostring(target[slot] or "") then
+                return false
+            end
+        end
+        return true
+    end
+
+    local function sendChanges()
+        local actual = getStoreTable("EquippedPets", true)
+        local changed = false
+
+        for slot = 1, amount do
+            local oldUID = slotValue(actual, slot)
+            local newUID = target[slot]
+            if tostring(oldUID or "") ~= tostring(newUID or "") and oldUID then
+                protectedCall("Unequip dungeon pet", function()
+                    ManagePet:FireServer(oldUID, "Unequip")
+                end)
+                changed = true
+                task.wait(0.08)
+            end
+        end
+
+        for slot = 1, amount do
+            local oldUID = slotValue(actual, slot)
+            local newUID = target[slot]
+            if newUID and tostring(oldUID or "") ~= tostring(newUID) then
+                protectedCall("Equip dungeon pet", function()
+                    ManagePet:FireServer(newUID, "Equip", slot)
+                end)
+                changed = true
+                task.wait(0.08)
+            end
+        end
+        return changed
+    end
+
+    for _ = 1, 3 do
+        sendChanges()
+        if matchesTarget() then
+            localData = getStoreTable("EquippedPets", true)
+            setStoreValue("EquippedPets", localData, 2)
+            return true
+        end
+        task.wait(0.35)
+    end
+
+    for slot = 1, amount do
+        localData[tostring(slot)] = target[slot] or nil
+    end
+    setStoreValue("EquippedPets", localData, 2)
     task.wait(0.35)
+    if matchesTarget() then
+        return true
+    end
+    return false, "Team pet chua dong bo du so luong equip."
 end
 
 local function applyDungeonTeam(index)
     local team = getStoreTable("PetTeams", true)[index]
     if type(team) ~= "table" then
-        return false
+        return false, "Khong tim thay team dungeon."
     end
-    applyEquippedPets(team.UIDs or {})
+    local applied, reason = applyEquippedPets(team.UIDs or {})
+    if not applied then
+        return false, reason
+    end
     return team
 end
 
@@ -2997,6 +3058,15 @@ function DungeonFarm.getDungeon()
     end
     local worlds = workspace:FindFirstChild("Worlds")
     return worlds and worlds:FindFirstChild("Dungeon")
+end
+
+function DungeonFarm.getOpenDungeon()
+    local worlds = workspace:FindFirstChild("Worlds")
+    local dungeon = worlds and worlds:FindFirstChild("Dungeon")
+    if dungeon and dungeon:GetAttribute("Active") then
+        return dungeon
+    end
+    return nil
 end
 
 function DungeonFarm.findPrompt(dungeon)
@@ -3993,18 +4063,10 @@ local function startAutoDungeon()
             Size = dungeonSelection.size
         })
     end)
-    task.wait(0.5)
-    protectedCall("Travel to dungeon", function()
-        local travelEvent = Bindable:FindFirstChild("AttemptTravel")
-        if not travelEvent then
-            error("Bindable.AttemptTravel khong ton tai")
-        end
-        travelEvent:Fire("Dungeon")
-    end)
-
     task.spawn(function()
-        local lastTravelAttempt = os.clock()
-        for _ = 1, 240 do
+        local lastTravelAttempt = 0
+        local activeSeen = false
+        for _ = 1, 480 do
             if not alive() or not dungeonActive then
                 return
             end
@@ -4026,7 +4088,30 @@ local function startAutoDungeon()
                 end
                 return
             end
-            if os.clock() - lastTravelAttempt >= 3 then
+
+            local openDungeon = DungeonFarm.getOpenDungeon()
+            if not openDungeon then
+                activeSeen = false
+                DungeonFarm.phase = "waiting_activation"
+                DungeonFarm.updateStatus(
+                    "Dungeon Farm: CHO MO",
+                    "Dang cho Dungeon.Active bat truoc khi teleport..."
+                )
+                task.wait(0.25)
+                continue
+            end
+
+            if not activeSeen then
+                activeSeen = true
+                lastTravelAttempt = os.clock()
+                protectedCall("Travel to active dungeon", function()
+                    local travelEvent = Bindable:FindFirstChild("AttemptTravel")
+                    if not travelEvent then
+                        error("Bindable.AttemptTravel khong ton tai")
+                    end
+                    travelEvent:Fire("Dungeon")
+                end)
+            elseif os.clock() - lastTravelAttempt >= 3 then
                 lastTravelAttempt = os.clock()
                 protectedCall("Retry travel to dungeon", function()
                     local travelEvent = Bindable:FindFirstChild("AttemptTravel")
@@ -4039,12 +4124,12 @@ local function startAutoDungeon()
         end
         if alive() and dungeonActive and not DungeonFarm.entered then
             DungeonFarm.phase = "waiting_entry"
-            DungeonFarm.lastMessage = "Dungeon da mo; dang cho vao dungeon thu cong."
+            DungeonFarm.lastMessage = "Dungeon da mo; dang cho ket noi teleport."
             DungeonFarm.updateStatus(
                 "Dungeon Farm: CHO VAO",
-                "Teleport tu dong loi. Hay vao Dungeon thu cong; farm se tu dong chay."
+                "Chua vao dungeon sau thoi gian cho; van giu che do cho de thu lai."
             )
-            notifyStatus("Auto Dungeon", "Dungeon da mo nhung teleport loi; vao Dungeon thu cong de farm tiep.")
+            notifyStatus("Auto Dungeon", "Dungeon da mo; dang cho teleport ket noi lai.")
         end
     end)
 end
@@ -4264,7 +4349,7 @@ local function buildDungeonControls()
         Desc = "Neu muc tieu gan hon moc nay thi dung teleport; xa hon se fly noclip.",
         Value = {
             Min = 25,
-            Max = 300,
+            Max = 1000,
             Default = DungeonFarm.teleportDistance
         },
         Step = 10,
@@ -4279,7 +4364,7 @@ local function buildDungeonControls()
         Desc = "Toc do di chuyen khi muc tieu nam ngoai moc teleport.",
         Value = {
             Min = 40,
-            Max = 300,
+            Max = 1000,
             Default = DungeonFarm.flySpeed
         },
         Step = 10,
