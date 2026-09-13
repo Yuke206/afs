@@ -3246,8 +3246,36 @@ function DungeonFarm.clearEnemies(dungeon, token)
         return false, "Bindable.SendPet khong ton tai."
     end
 
+    local function isLiveEnemy(enemy)
+        if not (enemy and enemy.Parent == enemies and enemy:IsA("Model")) then
+            return false
+        end
+        local health = Feature.getHealth(enemy)
+        return health == nil or health > 0
+    end
+
+    local function getLiveEnemies()
+        local result = {}
+        for _, enemy in ipairs(enemies:GetChildren()) do
+            if isLiveEnemy(enemy) then
+                table.insert(result, enemy)
+            end
+        end
+        return result
+    end
+
+    local function sendToEnemy(enemy)
+        local ok, err = pcall(function()
+            sendEvent:Fire(enemy, true, true)
+        end)
+        if not ok then
+            return false, "Gui pet loi: " .. tostring(err)
+        end
+        return true
+    end
+
     local deadline = os.clock() + 180
-    while enemies.Parent and #enemies:GetChildren() > 0 do
+    while enemies.Parent do
         if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
             return false, "Da dung dungeon farm."
         end
@@ -3258,46 +3286,80 @@ function DungeonFarm.clearEnemies(dungeon, token)
             return false, "Combat qua lau, het thoi gian cho room."
         end
 
-        local enemyList = enemies:GetChildren()
-        local sentAny = false
-        for index, enemy in ipairs(enemyList) do
-            if enemy:IsA("Model") and enemy.Parent == enemies then
-                DungeonFarm.updateStatus(
-                    "Dungeon Farm: COMBAT",
-                    string.format(
-                        "Room %s | Dang toi quai %d/%d | Con %d enemy",
-                        tostring(DungeonFarm.room or "?"),
-                        index,
-                        #enemyList,
-                        #enemies:GetChildren()
-                    )
-                )
-                if not DungeonFarm.flyTo(enemy, token) then
-                    return false, "Fly toi enemy " .. tostring(enemy.Name) .. " that bai."
-                end
-                if enemy.Parent == enemies then
-                    local ok, err = pcall(function()
-                        sendEvent:Fire(enemy, true, true)
-                    end)
-                    if not ok then
-                        return false, "Gui pet loi: " .. tostring(err)
-                    end
-                    sentAny = true
-                    task.wait(0.12)
-                end
-            end
+        local enemyList = getLiveEnemies()
+        if #enemyList == 0 then
+            DungeonFarm.lastEnemyCount = 0
+            return true, "Da clear enemy."
         end
 
-        DungeonFarm.lastEnemyCount = #enemies:GetChildren()
+        -- Hold one target until it dies so movement never skips ahead to another enemy.
+        local enemy = enemyList[1]
         DungeonFarm.updateStatus(
             "Dungeon Farm: COMBAT",
-            string.format("Room %s | Con %d enemy", tostring(DungeonFarm.room or "?"), DungeonFarm.lastEnemyCount)
+            string.format(
+                "Room %s | Dang toi quai %s | Con %d enemy",
+                tostring(DungeonFarm.room or "?"),
+                tostring(enemy.Name),
+                #enemyList
+            )
         )
-        task.wait(sentAny and 0.45 or 0.5)
+        if not DungeonFarm.flyTo(enemy, token) then
+            return false, "Fly toi enemy " .. tostring(enemy.Name) .. " that bai."
+        end
+
+        local lastSend = 0
+        while isLiveEnemy(enemy) do
+            if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
+                return false, "Da dung dungeon farm."
+            end
+            if tostring(getPlayerValue("World", "")) ~= "Dungeon" then
+                return false, "Da roi khoi dungeon."
+            end
+            if os.clock() >= deadline then
+                return false, "Combat qua lau, het thoi gian cho room."
+            end
+
+            -- Re-send only to the current target while it remains alive.
+            if os.clock() - lastSend >= 1 then
+                local ok, reason = sendToEnemy(enemy)
+                if not ok then
+                    return false, reason
+                end
+                lastSend = os.clock()
+            end
+
+            local remaining = #getLiveEnemies()
+            DungeonFarm.lastEnemyCount = remaining
+            DungeonFarm.updateStatus(
+                "Dungeon Farm: COMBAT",
+                string.format(
+                    "Room %s | Dang danh %s | Con %d enemy",
+                    tostring(DungeonFarm.room or "?"),
+                    tostring(enemy.Name),
+                    remaining
+                )
+            )
+            task.wait(0.25)
+        end
+
+        DungeonFarm.lastEnemyCount = #getLiveEnemies()
+        DungeonFarm.updateStatus(
+            "Dungeon Farm: COMBAT",
+            string.format(
+                "Room %s | Da ha %s | Con %d enemy",
+                tostring(DungeonFarm.room or "?"),
+                tostring(enemy.Name),
+                DungeonFarm.lastEnemyCount
+            )
+        )
+        task.wait(0.15)
     end
 
-    DungeonFarm.lastEnemyCount = 0
-    return true, "Da clear enemy."
+    if not enemies.Parent then
+        DungeonFarm.lastEnemyCount = 0
+        return true, "Da clear enemy."
+    end
+    return false, "Folder Enemies da bi dong khi dang combat."
 end
 
 function DungeonFarm.clearChests(dungeon, token)
