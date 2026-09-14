@@ -28,6 +28,33 @@ local function alive()
         and globalEnv.__AC_GENERATION == legacyGeneration
 end
 
+-- Teardown lan execute truoc: disconnect game connections cu + destroy
+-- WindUI window cu dung cach. Chi xoa con GUI se de lai ToggleKey handler
+-- (RightShift) va connections song song -> bam RightShift crash khi
+-- execute script 2 lan lien tiep.
+-- (Dung globalEnv/Feature thay vi local moi de tranh tran registers main chunk.)
+globalEnv.__afs_teardownPrevious = function()
+    globalEnv.__afs_connections = globalEnv.__afs_connections or {}
+    for _, conn in ipairs(globalEnv.__afs_connections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+    globalEnv.__afs_connections = {}
+    if globalEnv.__afs_window then
+        pcall(function()
+            globalEnv.__afs_window:Destroy()
+        end)
+        globalEnv.__afs_window = nil
+    end
+end
+globalEnv.__afs_teardownPrevious()
+globalEnv.__afs_trackConnection = function(conn)
+    globalEnv.__afs_connections = globalEnv.__afs_connections or {}
+    table.insert(globalEnv.__afs_connections, conn)
+    return conn
+end
+
 local function safeNotify(WindUI, title, content)
     pcall(function()
         WindUI:Notify({
@@ -84,6 +111,8 @@ local Window = WindUI:CreateWindow({
     HideSearchBar = true,
     ToggleKey = Enum.KeyCode.RightShift
 })
+
+globalEnv.__afs_window = Window
 
 local MainTab = Window:Tab({
     Title = "Main",
@@ -1524,6 +1553,16 @@ rebuildPetDropdowns = function()
     end
     selectedUID = orderedSelection
 
+    -- Danh sach pet khong doi thi giu dropdown cu (tao moi dropdown WindUI
+    -- voi hang tram pet la nguyen nhan do vai giay moi lan tai cau hinh).
+    local dropdownKey = table.concat(values, "\n") .. "|sel|" .. table.concat(selectedOptions, "\n")
+    if petDropdown and dropdownKey == Feature.lastPetDropdownKey then
+        updateSelectionInfo()
+        updateOccupiedInfo()
+        return
+    end
+    Feature.lastPetDropdownKey = dropdownKey
+
     local dropdownConfig = {
         Title = "Chon pet clone (toi da 4)",
         Desc = "Hien ten tu dat, loai, Level, UID. Thu tu chon se gan vao may A/B/K/M.",
@@ -1695,6 +1734,227 @@ function AutoPassive.resolvePendingAutoPassiveSelection()
     Feature.autoPassivePendingPets = nil
 end
 
+Feature.readPassiveMenu = function()
+    -- Tim menu dropdown Pet roll passive DANG MO. Tra ve {menu, picked} voi
+    -- picked la UID cac pet khop o Search hien tai (rong = khong chon gi de
+    -- tranh chon ca balo); nil neu khong thay menu.
+    -- (WindUI loc search bang TabItem.Visible; option text nam o
+    -- TabItem.Frame.Title.TextLabel.)
+    local maps = AutoPassiveMaps.optionToUID
+    local uiRoot = getUIRoot()
+    local dropdownRoot = uiRoot and uiRoot:FindFirstChild("WindUI/Dropdowns")
+    if not dropdownRoot then
+        return nil
+    end
+    local function isShown(inst, top)
+        local cur = inst
+        while cur and cur ~= top do
+            local vis = nil
+            pcall(function()
+                vis = cur.Visible
+            end)
+            if vis == false then
+                return false
+            end
+            cur = cur.Parent
+        end
+        return true
+    end
+    for _, canvas in ipairs(dropdownRoot:GetChildren()) do
+        local canvasVisible = false
+        pcall(function()
+            canvasVisible = canvas.Visible ~= false
+        end)
+        if canvasVisible then
+            local menu, needle = nil, ""
+            local labels = {}
+            for _, element in ipairs(canvas:GetDescendants()) do
+                if element:IsA("TextBox") then
+                    local placeholder, text = "", ""
+                    pcall(function()
+                        placeholder = element.PlaceholderText or ""
+                    end)
+                    pcall(function()
+                        text = element.Text or ""
+                    end)
+                    if string.find(string.lower(placeholder), "search", 1, true) then
+                        needle = text
+                        if not menu then
+                            menu = element.Parent
+                            while menu and menu.Parent ~= canvas do
+                                menu = menu.Parent
+                            end
+                        end
+                    end
+                elseif element:IsA("TextLabel") then
+                    local text = nil
+                    pcall(function()
+                        text = element.Text
+                    end)
+                    if type(text) == "string" and maps[text] ~= nil then
+                        table.insert(labels, element)
+                    end
+                end
+            end
+            if menu and #labels > 0 then
+                needle = string.lower(cleanText(needle))
+                if needle == "" then
+                    return {menu = menu, picked = {}}
+                end
+                local hidesMismatch = false
+                for _, label in ipairs(labels) do
+                    local text = ""
+                    pcall(function()
+                        text = string.lower(label.Text or "")
+                    end)
+                    if not string.find(text, needle, 1, true) and not isShown(label, menu) then
+                        hidesMismatch = true
+                        break
+                    end
+                end
+                local picked = {}
+                local seenUID = {}
+                for _, label in ipairs(labels) do
+                    local text = ""
+                    pcall(function()
+                        text = string.lower(label.Text or "")
+                    end)
+                    local matched = string.find(text, needle, 1, true) ~= nil
+                    local take = matched
+                    if hidesMismatch then
+                        take = matched and isShown(label, menu)
+                    end
+                    if take then
+                        local uid = nil
+                        pcall(function()
+                            uid = maps[label.Text]
+                        end)
+                        if uid ~= nil and not seenUID[tostring(uid)] then
+                            seenUID[tostring(uid)] = true
+                            table.insert(picked, uid)
+                        end
+                    end
+                end
+                return {menu = menu, picked = picked}
+            end
+        end
+    end
+    return nil
+end
+
+Feature.toggleVisiblePassivePets = function()
+    local info = Feature.readPassiveMenu()
+    if not info then
+        return
+    end
+    local picked = info.picked
+    if #picked == 0 then
+        notifyStatus("Auto Passive", "Khong thay pet nao khop Search.")
+        return
+    end
+    local selectedSet = {}
+    for _, uid in ipairs(Feature.autoPassiveSelectedUID) do
+        selectedSet[tostring(uid)] = true
+    end
+    local allSelected = true
+    for _, uid in ipairs(picked) do
+        if not selectedSet[tostring(uid)] then
+            allSelected = false
+            break
+        end
+    end
+    local nextSelection = {}
+    if allSelected then
+        local drop = {}
+        for _, uid in ipairs(picked) do
+            drop[tostring(uid)] = true
+        end
+        for _, uid in ipairs(Feature.autoPassiveSelectedUID) do
+            if not drop[tostring(uid)] then
+                table.insert(nextSelection, uid)
+            end
+        end
+    else
+        nextSelection = Feature.autoPassiveSelectedUID
+        for _, uid in ipairs(picked) do
+            if not selectedSet[tostring(uid)] then
+                selectedSet[tostring(uid)] = true
+                table.insert(nextSelection, uid)
+            end
+        end
+    end
+    Feature.autoPassiveSelectedUID = nextSelection
+    local options = {}
+    for _, uid in ipairs(nextSelection) do
+        local option = AutoPassiveMaps.optionByUID[tostring(uid)]
+        if option then
+            table.insert(options, option)
+        end
+    end
+    -- Cap nhat tick truc tiep, KHONG rebuild (rebuild se dong menu dang mo).
+    beginDropdownSync()
+    if Feature.autoPassivePetDropdown then
+        pcall(function()
+            Feature.autoPassivePetDropdown:Select(options)
+        end)
+    end
+    Feature.updateAutoPassiveStatus()
+    saveConfig(true)
+end
+
+Feature.pollPassiveMenuInject = function()
+    -- Gan o tick chon-tat-ca vao trong menu dropdown dang mo, ngay duoi o
+    -- Search (bam trong menu nen khong bi dong menu). Menu dong/mo lai thi
+    -- tu gan lai vi nut la con cua menu.
+    local info = Feature.readPassiveMenu()
+    if not info or not info.menu or not info.menu.Parent then
+        return
+    end
+    local menu = info.menu
+    local button = menu:FindFirstChild("__AFS_SelectAll")
+    if not button or not button.Parent then
+        button = Instance.new("TextButton")
+        button.Name = "__AFS_SelectAll"
+        button.Size = UDim2.new(1, 0, 0, 30)
+        button.LayoutOrder = 2
+        button.Font = Enum.Font.GothamMedium
+        button.TextSize = 14
+        button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        button.BackgroundColor3 = Color3.fromRGB(45, 48, 56)
+        button.BorderSizePixel = 0
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = button
+        button.Parent = menu
+        button.MouseButton1Click:Connect(function()
+            protectedCall("Passive select-all toggle", function()
+                Feature.toggleVisiblePassivePets()
+            end)
+        end)
+    end
+    local picked = info.picked
+    local selectedSet = {}
+    for _, uid in ipairs(Feature.autoPassiveSelectedUID) do
+        selectedSet[tostring(uid)] = true
+    end
+    local allSelected = #picked > 0
+    for _, uid in ipairs(picked) do
+        if not selectedSet[tostring(uid)] then
+            allSelected = false
+            break
+        end
+    end
+    pcall(function()
+        if #picked == 0 then
+            button.Text = "[ ] Chon tat ca (go Search truoc)"
+        elseif allSelected then
+            button.Text = string.format("[x] Bo chon %d pet", #picked)
+        else
+            button.Text = string.format("[ ] Chon tat ca %d pet", #picked)
+        end
+    end)
+end
+
 Feature.rebuildAutoPassivePetDropdown = function()
     beginDropdownSync()
     AutoPassive.resolvePendingAutoPassiveSelection()
@@ -1702,13 +1962,26 @@ Feature.rebuildAutoPassivePetDropdown = function()
     AutoPassiveMaps.optionByUID = {}
 
     local values = {}
+    local labelCount = {}
     for _, pet in ipairs(AutoPassive.getPassivePets()) do
-        local option = string.format(
-            "%s | Lv.%s | UID:%s",
-            petDisplayName(pet),
-            tostring(pet.Level or "?"),
-            tostring(pet.UID)
-        )
+        -- Chi hien ten + passive (khong UID/Lv cho gon); trung ten thi danh
+        -- so phan biet de map option->UID khong bi de nhau.
+        local passives = {}
+        if type(pet.Passives) == "table" then
+            for _, name in ipairs(pet.Passives) do
+                local text = cleanText(name)
+                if text ~= "" then
+                    table.insert(passives, text)
+                end
+            end
+        end
+        local passiveText = #passives > 0 and table.concat(passives, ", ") or "Chua co passive"
+        local base = string.format("%s | %s", petDisplayName(pet), passiveText)
+        labelCount[base] = (labelCount[base] or 0) + 1
+        local option = base
+        if labelCount[base] > 1 then
+            option = string.format("%s (%d)", base, labelCount[base])
+        end
         AutoPassiveMaps.optionToUID[option] = pet.UID
         AutoPassiveMaps.optionByUID[tostring(pet.UID)] = option
         table.insert(values, option)
@@ -1733,6 +2006,15 @@ Feature.rebuildAutoPassivePetDropdown = function()
         end
     end
     Feature.autoPassiveSelectedUID = orderedSelection
+
+    -- Giu dropdown cu khi danh sach khong doi (chong do nhu dropdown clone).
+    local passiveDropdownKey = table.concat(values, "\n") .. "|sel|" .. table.concat(selectedOptions, "\n")
+    if Feature.autoPassivePetDropdown
+        and passiveDropdownKey == Feature.lastPassivePetDropdownKey then
+        Feature.updateAutoPassiveStatus()
+        return
+    end
+    Feature.lastPassivePetDropdownKey = passiveDropdownKey
 
     local dropdownConfig = {
         Title = "Pet roll passive",
@@ -2456,11 +2738,32 @@ local function moveToMachine(machine)
     if not ok or not pivot then
         return false
     end
+    local dest = CFrame.new(pivot.Position + Vector3.new(0, 4, 0))
     pcall(function()
-        character:PivotTo(CFrame.new(pivot.Position + Vector3.new(0, 4, 0)))
+        character:PivotTo(dest)
     end)
-    task.wait(0.35)
-    return true
+    -- Cho server nhan vi tri moi truoc khi Fire: server tu choi nap pet tu
+    -- xa (0.35s cu khong du de replicate, nhat la khi doi world). Poll toi
+    -- khi dung gan may (<=25), toi da 3 giay; giu chan neu bi keo ve.
+    local deadline = os.clock() + 3
+    while os.clock() < deadline do
+        local char = LocalPlayer.Character
+        local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+        local pos = nil
+        pcall(function()
+            pos = root and root.Position or nil
+        end)
+        if pos and (pos - pivot.Position).Magnitude <= 25 then
+            return true
+        end
+        if char then
+            pcall(function()
+                char:PivotTo(dest)
+            end)
+        end
+        task.wait(0.25)
+    end
+    return false
 end
 
 local function restoreInitialLocation()
@@ -2539,7 +2842,23 @@ local function doClone(machineId, pet)
         return false
     end
 
-    return true
+    -- Xac minh server da nhan (poll authoritative toi da 2s). That bai thi
+    -- mo khoa cho thu lai ngay vong sau thay vi khoa 4s nhu truoc.
+    local verified = false
+    local deadline = os.clock() + 2
+    while os.clock() < deadline do
+        local data = getStoreTable("CloneMachineData", true)
+        local record = type(data) == "table" and type(data[machineId]) == "table" and data[machineId] or nil
+        if record and tostring(record.UID) == tostring(pet.UID) then
+            verified = true
+            break
+        end
+        task.wait(0.25)
+    end
+    if not verified then
+        lastAction[machineId] = nil
+    end
+    return verified
 end
 
 local function autoStep()
@@ -5805,7 +6124,8 @@ local function restoreDungeonSession(reason)
     end
     session.restoring = true
     dungeonActive = false
-    Feature.autoDungeonEnabled = false
+    -- Khong tat Auto Mo o day: xong 1 luot thi tu mo luot tiep (fail() va
+    -- startAutoDungeon() tu tat toggle khi het summon/artifact).
     DungeonFarm.token = DungeonFarm.token + 1
     DungeonFarm.running = false
     DungeonFarm.entered = false
@@ -5846,13 +6166,6 @@ local function restoreDungeonSession(reason)
     DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", DungeonFarm.lastMessage)
     dungeonWaiting = false
     dungeonWaitToken = dungeonWaitToken + 1
-    if dungeonToggle then
-        dungeonToggleUpdating = true
-        pcall(function()
-            dungeonToggle:Set(false)
-        end)
-        dungeonToggleUpdating = false
-    end
     saveConfig(true)
 
     task.spawn(function()
@@ -5906,6 +6219,14 @@ local function restoreDungeonSession(reason)
             dungeonSession = nil
             notifyStatus("Auto Dungeon", reason or "Da khoi phuc cau hinh")
             updateMachineStatus()
+            -- Auto Mo van bat thi tu mo luot tiep (cho server on dinh chut;
+            -- startAutoDungeon tu cho cooldown/slot trong).
+            if alive() and Feature.autoDungeonEnabled then
+                task.wait(3)
+                if alive() and Feature.autoDungeonEnabled then
+                    protectedCall("Reopen dungeon", startAutoDungeon)
+                end
+            end
         end)
     end)
 end
@@ -6992,7 +7313,7 @@ globalEnv.__auto_clone_debug.state = function()
     }
 end
 
-dungeonFinishConnection = DungeonFinish.OnClientEvent:Connect(function()
+dungeonFinishConnection = globalEnv.__afs_trackConnection(DungeonFinish.OnClientEvent:Connect(function()
     if alive() and dungeonActive then
         task.delay(1, function()
             if alive() and dungeonActive then
@@ -7020,12 +7341,12 @@ dungeonFinishConnection = DungeonFinish.OnClientEvent:Connect(function()
             end
         end)
     end
-end)
+end))
 
 local worldValue = LocalPlayer:FindFirstChild("World") or LocalPlayer:WaitForChild("World", 10)
 local dungeonWorldConnection
 if worldValue then
-    dungeonWorldConnection = worldValue.Changed:Connect(function(value)
+    dungeonWorldConnection = globalEnv.__afs_trackConnection(worldValue.Changed:Connect(function(value)
         if alive() and tostring(value) == "Dungeon" then
             dungeonActive = true
             DungeonFarm.entered = true
@@ -7069,7 +7390,7 @@ if worldValue then
                 end
             end)
         end
-    end)
+    end))
 end
 
 local function buildDungeonControls()
@@ -7474,6 +7795,14 @@ function AutoPassive.buildAutoPassiveControls()
             saveConfig(true)
         end
     })
+
+    -- Vong nen gan o tick chon-tat-ca vao menu dropdown passive dang mo.
+    task.spawn(function()
+        while alive() do
+            protectedCall("Passive menu watch", Feature.pollPassiveMenuInject)
+            task.wait(0.5)
+        end
+    end)
 end
 
 Feature.mainStatusParagraph = MainTab:Button({
@@ -7774,20 +8103,30 @@ SettingsTab:Button({
     Title = utf8Text("Tai cau hinh", 84, 7843, 105, 32, 99, 7845, 117, 32, 104, 236, 110, 104),
     Desc = utf8Text("Nap lai danh sach pet va thiet lap da luu", 78, 7841, 112, 32, 108, 7841, 105, 32, 100, 97, 110, 104, 32, 115, 225, 99, 104, 32, 112, 101, 116, 32, 118, 224, 32, 116, 104, 105, 7871, 116, 32, 108, 7853, 112, 32, 273, 227, 32, 108, 432, 117),
     Callback = function()
-        controlsReady = false
-        beginConfigApply()
-        protectedCall("Load config", function()
-            if autoEnabled then
-                stopAutoAndReturn()
-            end
-            loadConfig()
-            scanPets()
-            updateMachineStatus()
-            syncDungeonControls()
-            Feature.syncControls()
-            Feature.applySavedState()
+        -- Chay nen de nut nha ra ngay; dropdown giu lai khi pet khong doi
+        -- nen lan tai lai sau cung nhe hon nhieu.
+        notifyStatus("Cau hinh", "Dang tai cau hinh...")
+        task.spawn(function()
+            controlsReady = false
+            beginConfigApply()
+            protectedCall("Load config", function()
+                if autoEnabled then
+                    stopAutoAndReturn()
+                end
+                loadConfig()
+                scanPets()
+                task.wait()
+                updateMachineStatus()
+                task.wait()
+                syncDungeonControls()
+                task.wait()
+                Feature.syncControls()
+                task.wait()
+                Feature.applySavedState()
+            end)
+            controlsReady = true
+            notifyStatus("Cau hinh", "Da tai xong cau hinh.")
         end)
-        controlsReady = true
     end
 })
 
