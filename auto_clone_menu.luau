@@ -15,6 +15,7 @@ pcall(function()
     end
 end)
 local globalEnv = getgenv()
+globalEnv.__afs_build = 14
 globalEnv.__auto_clone_state = globalEnv.__auto_clone_state or {generation = 0}
 local persistentState = globalEnv.__auto_clone_state
 persistentState.generation = (persistentState.generation or 0) + 1
@@ -448,6 +449,7 @@ local DungeonFarm = {
     goldTargetKey = nil,
     goldTargetRoom = nil,
     goldRoomKeys = {},
+    greenRoomKeys = {},
     goldContentActive = false,
     goldRoomEmptySince = {},
     routeFolder = nil,
@@ -1132,7 +1134,16 @@ local function saveConfig(silent)
                 autoPassive = Feature.autoPassiveEnabled,
                 autoCollectDrops = Feature.autoCollectDropsEnabled,
                 tpPet = Feature.tpPetEnabled,
-                attackWhileUlt = Feature.attackWhileUltEnabled
+                attackWhileUlt = Feature.attackWhileUltEnabled,
+                autoGate = Feature.gateFarm.enabled,
+                autoGateOpen = Feature.gateFarm.openEnabled,
+                autoGateFarm = Feature.gateFarm.farmEnabled
+            },
+            gate = {
+                gateId = Feature.gateFarm.gateId,
+                amount = Feature.gateFarm.amount,
+                teamIndex = Feature.gateFarm.teamIndex,
+                maxRuns = Feature.gateFarm.maxRuns
             },
             autoFarm = {
                 mode = Feature.autoFarmMode
@@ -1193,8 +1204,24 @@ local function loadConfig()
             autoPassive = data.features.autoPassive == true,
             autoCollectDrops = data.features.autoCollectDrops == true,
             tpPet = data.features.tpPet == true,
-            attackWhileUlt = data.features.attackWhileUlt == true
+            attackWhileUlt = data.features.attackWhileUlt == true,
+            autoGate = data.features.autoGate == true,
+            autoGateOpen = data.features.autoGateOpen == nil
+                and data.features.autoGate == true
+                or data.features.autoGateOpen == true,
+            autoGateFarm = data.features.autoGateFarm == nil
+                and data.features.autoGate == true
+                or data.features.autoGateFarm == true
         }
+    end
+    if type(data.gate) == "table" then
+        local farm = Feature.gateFarm
+        if type(data.gate.gateId) == "string" and data.gate.gateId ~= "" then
+            farm.gateId = data.gate.gateId
+        end
+        farm.amount = math.clamp(math.floor(tonumber(data.gate.amount) or farm.amount), 1, 5)
+        farm.teamIndex = math.max(1, math.floor(tonumber(data.gate.teamIndex) or farm.teamIndex))
+        farm.maxRuns = math.clamp(math.floor(tonumber(data.gate.maxRuns) or farm.maxRuns), 1, 20)
     end
     if type(data.autoFarm) == "table" then
         local mode = data.autoFarm.mode
@@ -2997,6 +3024,11 @@ function Feature.updateMainStatus(force)
             collect = Feature.autoCollectDropsEnabled,
             tpPet = Feature.tpPetEnabled,
             ultHit = Feature.attackWhileUltEnabled,
+            autoDungeon = Feature.autoDungeonEnabled,
+            dungeonFarm = DungeonFarm.enabled,
+            dungeonActive = dungeonActive,
+            dungeonWaiting = dungeonWaiting,
+            dungeonPhase = DungeonFarm.phase,
         }
     end)
     setParagraph(
@@ -3702,7 +3734,9 @@ function DungeonFarm.ensureEntryTeam(role)
 end
 
 function DungeonFarm.getRoomTeamIndex(room)
-    if DungeonFarm.goldRoomKeys[room and room:GetFullName() or ""] then
+    local key = room and room:GetFullName() or ""
+    if DungeonFarm.goldRoomKeys[key]
+        or (DungeonFarm.greenRoomKeys and DungeonFarm.greenRoomKeys[key]) then
         return tonumber(dungeonSelection.goldTeamIndex)
             or tonumber(dungeonSelection.normalTeamIndex)
             or tonumber(dungeonSelection.teamIndex)
@@ -4142,6 +4176,11 @@ function DungeonFarm.rebuildRoute(dungeon)
     end
     for _, entry in ipairs(goldEntries) do
         DungeonFarm.goldRoomKeys[entry.key] = true
+    end
+    -- Room xanh la (final) dung chung team vang; room do (boss) giu team thuong.
+    DungeonFarm.greenRoomKeys = {}
+    for _, entry in ipairs(DungeonFarm.findGreenRoomsFromMap(dungeon, rooms)) do
+        DungeonFarm.greenRoomKeys[entry.key] = true
     end
 
     local function linkByCoordinate(entry, nextX, nextY)
@@ -4723,6 +4762,45 @@ function DungeonFarm.isGoldRunComplete(dungeon)
         end
     end
 
+    return #DungeonFarm.getChestTargets(dungeon) == 0
+end
+
+function DungeonFarm.isNativeGreenCell(cell)
+    -- MapColors[4] trong DungeonGenerator: (101, 185, 101) = room xanh la
+    -- cuoi main path (sau boss do). Tuong tu isNativeGoldCell.
+    if not (cell and cell:IsA("GuiObject")) then
+        return false
+    end
+    local color = cell.BackgroundColor3
+    return math.abs(color.R - 101 / 255) <= 0.02
+        and math.abs(color.G - 185 / 255) <= 0.02
+        and math.abs(color.B - 101 / 255) <= 0.02
+end
+
+function DungeonFarm.findGreenRoomsFromMap(dungeon, rooms)
+    local result = {}
+    local _, nativeCells = DungeonFarm.getNativeMapCells()
+    for _, entry in ipairs(rooms) do
+        local cell = nativeCells[tostring(entry.x) .. ":" .. tostring(entry.y)]
+        if DungeonFarm.isNativeGreenCell(cell) then
+            table.insert(result, entry)
+        end
+    end
+    return result
+end
+
+function DungeonFarm.isGreenRunComplete(dungeon)
+    -- Xong khi: khong co room xanh nao, hoac tat ca da clear + het chest.
+    local rooms = DungeonFarm.getRouteRooms(dungeon)
+    local greens = DungeonFarm.findGreenRoomsFromMap(dungeon, rooms)
+    if #greens == 0 then
+        return true
+    end
+    for _, entry in ipairs(greens) do
+        if entry.room.Parent and not DungeonFarm.completed[entry.key] then
+            return false
+        end
+    end
     return #DungeonFarm.getChestTargets(dungeon) == 0
 end
 
@@ -5315,6 +5393,14 @@ function DungeonFarm.fail(reason, token)
         end)
         dungeonToggleUpdating = false
     end
+    DungeonFarm.enabled = false
+    if dungeonFarmToggle then
+        DungeonFarm.toggleUpdating = true
+        pcall(function()
+            dungeonFarmToggle:Set(false)
+        end)
+        DungeonFarm.toggleUpdating = false
+    end
     saveConfig(true)
     if DungeonFarm.restore then
         task.spawn(function()
@@ -5370,6 +5456,7 @@ function DungeonFarm.start()
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
     DungeonFarm.goldRoomEmptySince = {}
+    DungeonFarm.greenWaitSince = nil
     DungeonFarm.lastEquippedPetCount = DungeonFarm.getEquippedPetCount()
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
@@ -5510,14 +5597,42 @@ function DungeonFarm.start()
                         end
                     else
                         if DungeonFarm.isGoldRunComplete(dungeon) then
-                            local left, reason = DungeonFarm.leaveAfterGold(token)
-                            if not left then
-                                DungeonFarm.fail(reason, token)
+                            if DungeonFarm.isGreenRunComplete(dungeon) then
+                                local left, reason = DungeonFarm.leaveAfterGold(token)
+                                if not left then
+                                    DungeonFarm.fail(reason, token)
+                                end
+                                return
                             end
-                            return
+                            -- Gold xong: farm not room xanh la cuoi truoc khi out.
+                            -- Roi xuong duoi, findPrompt se tu active/clear cac
+                            -- room con lai (het gold thi no chon prompt gan nhat).
+                            -- Chong ket: qua 5 phut khong xong xanh thi van out.
+                            DungeonFarm.greenWaitSince = DungeonFarm.greenWaitSince or os.clock()
+                            if os.clock() - DungeonFarm.greenWaitSince >= 300 then
+                                DungeonFarm.updateStatus(
+                                    "Dungeon Farm: OUT",
+                                    "Qua 5 phut chua xong room xanh; out..."
+                                )
+                                local left, reason = DungeonFarm.leaveAfterGold(token)
+                                if not left then
+                                    DungeonFarm.fail(reason, token)
+                                end
+                                return
+                            end
+                            DungeonFarm.phase = "final"
+                            DungeonFarm.updateStatus(
+                                "Dungeon Farm: FINAL",
+                                "Da xong room vang; dang farm room xanh la cuoi..."
+                            )
                         end
 
-                        local doorPrompt, doorPart, doorRoom = DungeonFarm.findGoldDoor(dungeon)
+                        -- Gold da xong (dang farm room xanh): khong mo cua vang
+                        -- nua, di thang toi prompt room thuong.
+                        local doorPrompt, doorPart, doorRoom
+                        if DungeonFarm.greenWaitSince == nil then
+                            doorPrompt, doorPart, doorRoom = DungeonFarm.findGoldDoor(dungeon)
+                        end
                         if doorPrompt then
                             if not DungeonFarm.ensureRoomTeam(doorRoom) then
                                 DungeonFarm.phase = "team_retry"
@@ -5802,7 +5917,7 @@ function DungeonFarm.leaveAfterGold(token)
         return false, "Dungeon farm token da thay doi."
     end
     DungeonFarm.phase = "leaving"
-    DungeonFarm.updateStatus("Dungeon Farm: OUT", "Da clear tat ca room vang; dang roi Dungeon...")
+    DungeonFarm.updateStatus("Dungeon Farm: OUT", "Da farm xong dungeon; dang roi Dungeon...")
 
     local ok, reason = protectedCall("Leave dungeon after gold room", function()
         local travelEvent = Bindable:FindFirstChild("AttemptTravel")
@@ -5821,7 +5936,7 @@ function DungeonFarm.leaveAfterGold(token)
             if dungeonSession and not dungeonSession.restoring then
                 task.delay(0.75, function()
                     if alive() and dungeonSession and not dungeonSession.restoring then
-                        restoreDungeonSession("Da farm xong room vang")
+                        restoreDungeonSession("Da farm xong dungeon")
                     end
                 end)
             end
@@ -5830,7 +5945,697 @@ function DungeonFarm.leaveAfterGold(token)
         end
         task.wait(0.25)
     end
-    return false, "Khong roi duoc Dungeon sau khi clear room vang."
+    return false, "Khong roi duoc Dungeon sau khi farm xong."
+end
+
+-- Auto Gate (GatesMode): summon gate rank da chon, equip team, join, farm.
+-- Khong them local top-level o day (main chunk da sat gioi han registers):
+-- state nam trong Feature.gateFarm, ham dang Feature.gate*.
+Feature.gateFarm = {
+    enabled = false,
+    openEnabled = false,
+    farmEnabled = false,
+    running = false,
+    token = 0,
+    gateId = "ERankGate",
+    amount = 1,
+    teamIndex = 1,
+    maxRuns = 5,
+    runsDone = 0,
+    phase = "idle",
+    lastMessage = "Chua chay.",
+    wasInside = false,
+    homeWorld = nil,
+    emptySince = nil,
+    insideSince = nil,
+}
+
+function Feature.gateRanks()
+    return {
+        {id = "ERankGate", name = "E Rank"},
+        {id = "DRankGate", name = "D Rank"},
+        {id = "CRankGate", name = "C Rank"},
+        {id = "BRankGate", name = "B Rank"},
+        {id = "ARankGate", name = "A Rank"},
+        {id = "SRankGate", name = "S Rank"},
+        {id = "ZRankGate", name = "Z Rank"},
+        {id = "XRankGate", name = "X Rank"},
+        {id = "AnniversaryRankGate", name = "Anniversary"},
+    }
+end
+
+function Feature.gateOwned()
+    local items = getStoreTable("Items", true)
+    local result = {}
+    for _, rank in ipairs(Feature.gateRanks()) do
+        result[rank.id] = tonumber(items[rank.id]) or 0
+    end
+    return result
+end
+
+function Feature.gateGetDifficulty(gateId)
+    local farm = Feature.gateFarm
+    if not farm.itemStats then
+        local ok, stats = pcall(function()
+            return require(ReplicatedStorage.ModuleScripts.ItemStats)
+        end)
+        if not ok or type(stats) ~= "table" then
+            return nil
+        end
+        farm.itemStats = stats
+    end
+    local entry = farm.itemStats[gateId]
+    return type(entry) == "table" and entry.GateDifficulty or nil
+end
+
+function Feature.gatePickGate()
+    -- Chon gate de mo: uu tien gate dang chon (target); het thi rot xuong
+    -- rank thap hon con hang. Moi luot mo danh gia lai tu dau nen dang farm
+    -- gate thap ma rot ra gate cao la tu quay len ngay lap tuc.
+    -- Tra ve gateId, have; het sach tu target tro xuong thi tra ve nil.
+    local farm = Feature.gateFarm
+    local ranks = Feature.gateRanks()
+    local owned = Feature.gateOwned()
+    local targetIndex = 1
+    for index, rank in ipairs(ranks) do
+        if rank.id == farm.gateId then
+            targetIndex = index
+            break
+        end
+    end
+    for index = targetIndex, 1, -1 do
+        local id = ranks[index].id
+        if (owned[id] or 0) >= 1 then
+            return id, owned[id]
+        end
+    end
+    return nil, 0
+end
+
+function Feature.gateReadOpen()
+    local gate = workspace:FindFirstChild("Worlds")
+        and workspace.Worlds:FindFirstChild("TimeChamber")
+        and workspace.Worlds.TimeChamber:FindFirstChild("Gate")
+    if not gate then
+        return false, nil
+    end
+    local open = false
+    pcall(function()
+        open = CollectionService:HasTag(gate, "GateOpen") == true
+    end)
+    if not open then
+        return false, nil
+    end
+    local runId = gate:GetAttribute("run_id")
+    if runId == nil then
+        return false, nil
+    end
+    return true, runId
+end
+
+function Feature.gateUpdateStatus(title, desc)
+    local farm = Feature.gateFarm
+    farm.lastMessage = tostring(desc or "")
+    if farm.statusParagraph then
+        setParagraph(farm.statusParagraph, title, desc)
+    end
+end
+
+function Feature.gateSyncEnabled()
+    -- enabled la master switch: loop chay khi it nhat 1 trong 2 bat.
+    Feature.gateFarm.enabled = Feature.gateFarm.openEnabled or Feature.gateFarm.farmEnabled
+end
+
+function Feature.gateToggleOff(reason)
+    -- 1 toggle tat: neu toggle kia con bat thi giu loop, chi bao status;
+    -- ca 2 tat moi dung loop (va ve nha neu dang trong gate).
+    local farm = Feature.gateFarm
+    if farm.enabled then
+        Feature.gateUpdateStatus("Auto Gate", tostring(reason))
+        return
+    end
+    local inGate = tostring(getPlayerValue("World", "")) == "GatesMode"
+    Feature.gateStop(reason)
+    if inGate then
+        Feature.gateGoHome(reason)
+    end
+end
+
+function Feature.gateFail(reason)
+    local farm = Feature.gateFarm
+    farm.token = farm.token + 1
+    farm.running = false
+    farm.phase = "error"
+    Feature.gateUpdateStatus("Auto Gate: LOI", tostring(reason))
+    notifyStatus("Auto Gate", "Loi: " .. tostring(reason))
+    farm.openEnabled = false
+    farm.farmEnabled = false
+    Feature.gateSyncEnabled()
+    if farm.openToggle then
+        farm.toggleUpdating = true
+        pcall(function()
+            farm.openToggle:Set(false)
+        end)
+        farm.toggleUpdating = false
+    end
+    if farm.farmToggle then
+        farm.toggleUpdating = true
+        pcall(function()
+            farm.farmToggle:Set(false)
+        end)
+        farm.toggleUpdating = false
+    end
+    saveConfig(true)
+end
+
+function Feature.gateEnsureTeam(index)
+    index = math.max(1, math.floor(tonumber(index) or 1))
+    local teams = getStoreTable("PetTeams", true)
+    local team = teams[index]
+    if type(team) ~= "table" then
+        return false
+    end
+    local equipTeam, reason = DungeonFarm.findNativeEquipTeam()
+    if not equipTeam then
+        Feature.gateUpdateStatus("Auto Gate: TEAM", tostring(reason))
+        return false
+    end
+    local deadline = os.clock() + 12
+    while alive() and os.clock() < deadline do
+        local ok = true
+        local amount = DungeonFarm.getEquipSlotCount()
+        if amount > 0 and DungeonFarm.getEquippedPetCount() > 0 then
+            local equipped = getStoreTable("EquippedPets", true)
+            for slot = 1, amount do
+                local actual = equipped[tostring(slot)] or equipped[slot]
+                if DungeonFarm.normalizedUID(actual)
+                    ~= DungeonFarm.normalizedUID(DungeonFarm.getTeamSlotUID(team, slot)) then
+                    ok = false
+                    break
+                end
+            end
+            if ok then
+                return true
+            end
+        else
+            ok = false
+        end
+        if not ok then
+            pcall(function()
+                equipTeam(index)
+            end)
+        end
+        task.wait(0.5)
+    end
+    return false
+end
+
+function Feature.gateIsLiveEnemy(model)
+    -- Dieu kien song cua quai gate theo dung chuan game:
+    -- TargetHandler.find_possible quet tag Attackable (tru Untouchable),
+    -- health <= 0 (neu doc duoc) coi nhu chet.
+    local valid = false
+    pcall(function()
+        valid = model:IsA("Model") and model.Parent ~= nil
+    end)
+    if not valid then
+        return false
+    end
+    local dead, aliveFlag = false, true
+    pcall(function()
+        dead = model:GetAttribute("Dead") == true or model:GetAttribute("IsDead") == true
+        aliveFlag = model:GetAttribute("Alive") ~= false
+    end)
+    if dead or not aliveFlag then
+        return false
+    end
+    local attackable, untouchable = false, false
+    pcall(function()
+        attackable = CollectionService:HasTag(model, "Attackable")
+        untouchable = CollectionService:HasTag(model, "Untouchable")
+    end)
+    if untouchable or not attackable then
+        return false
+    end
+    local health = Feature.getHealth(model)
+    if health ~= nil and health <= 0 then
+        return false
+    end
+    return true
+end
+
+function Feature.gateInScope(model)
+    -- Game quet tag Attackable tren TOAN game (moi world deu co quai ton tai),
+    -- nen phai gioi han trong GatesMode keo gui pet sang map world khac.
+    local worlds = workspace:FindFirstChild("Worlds")
+    local gateWorld = worlds and worlds:FindFirstChild("GatesMode")
+    if gateWorld then
+        local inside = false
+        pcall(function()
+            inside = model:IsDescendantOf(gateWorld)
+        end)
+        if inside then
+            return true
+        end
+    end
+    local parent = model.Parent
+    if parent == workspace:FindFirstChild("Enemies")
+        or parent == workspace:FindFirstChild("NewEnemies") then
+        return true
+    end
+    return false
+end
+
+function Feature.gatePrepareEnemy(enemy)
+    -- Giong DungeonFarm prepareEnemy: LocalPetHandler chi nhan pet khi enemy
+    -- co PrimaryPart + folder Attackers (find_nearest_slot doc
+    -- enemy.Attackers; thieu la Fire loi vo ich). Tu gan PrimaryPart neu tim
+    -- thay, tra ve nil khi quai chua spawn xong de chon con READY khac.
+    local valid = false
+    pcall(function()
+        valid = enemy:IsA("Model") and enemy.Parent ~= nil
+    end)
+    if not valid then
+        return nil
+    end
+    local primary = enemy.PrimaryPart
+        or enemy:FindFirstChild("HumanoidRootPart", true)
+        or enemy:FindFirstChild("RootPart", true)
+    if primary and primary:IsA("BasePart") and not enemy.PrimaryPart then
+        pcall(function()
+            enemy.PrimaryPart = primary
+        end)
+    end
+    if enemy.PrimaryPart == nil or enemy:FindFirstChild("Attackers") == nil then
+        return nil
+    end
+    return enemy.PrimaryPart
+end
+
+function Feature.gateGetEnemies()
+    if tostring(getPlayerValue("World", "")) ~= "GatesMode" then
+        return {}
+    end
+    local result = {}
+    local seen = {}
+    -- Quet chinh theo tag Attackable nhu game (TargetHandler.find_possible).
+    local ok, tagged = pcall(function()
+        return CollectionService:GetTagged("Attackable")
+    end)
+    if ok and type(tagged) == "table" then
+        for _, model in ipairs(tagged) do
+            local valid = false
+            pcall(function()
+                valid = model:IsA("Model") and not seen[model]
+            end)
+            if valid then
+                seen[model] = true
+                if Feature.gateInScope(model) and Feature.gateIsLiveEnemy(model) then
+                    table.insert(result, model)
+                end
+            end
+        end
+    end
+    -- Fallback: quai vua spawn chua kip co tag Attackable thi van thay trong
+    -- folder Enemies/NewEnemies neu co root + health>0 (da loc Untouchable).
+    for _, target in ipairs(Feature.getTargets()) do
+        local model = target.model
+        local valid = false
+        pcall(function()
+            valid = model:IsA("Model") and model.Parent ~= nil and not seen[model]
+        end)
+        if valid then
+            seen[model] = true
+            if Feature.gateInScope(model) then
+                table.insert(result, model)
+            end
+        end
+    end
+    return result
+end
+
+function Feature.gatePickTarget()
+    -- Chon muc tieu trong gate theo che do farm hien tai, nhung CHI chon
+    -- quai READY (co PrimaryPart + Attackers) nhu dungeon de SendPet co tac
+    -- dung thay vi Fire vao model dang spawn.
+    local character = LocalPlayer.Character
+    local playerRoot = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not playerRoot then
+        return nil
+    end
+    local selected
+    for _, model in ipairs(Feature.gateGetEnemies()) do
+        local primary = Feature.gatePrepareEnemy(model)
+        if primary then
+            local root = Feature.getRoot(model) or primary
+            local pos = nil
+            pcall(function()
+                pos = root.Position
+            end)
+            if pos then
+                local candidate = {
+                    model = model,
+                    root = root,
+                    distance = (pos - playerRoot.Position).Magnitude,
+                    health = Feature.getHealth(model)
+                }
+                if not selected then
+                    selected = candidate
+                elseif Feature.autoFarmMode == Feature.MODE_LOWEST_HEALTH then
+                    local ch = candidate.health == nil and math.huge or candidate.health
+                    local sh = selected.health == nil and math.huge or selected.health
+                    if ch < sh or (ch == sh and candidate.distance < selected.distance) then
+                        selected = candidate
+                    end
+                elseif Feature.autoFarmMode == Feature.MODE_HIGHEST_HEALTH then
+                    local ch = candidate.health == nil and -math.huge or candidate.health
+                    local sh = selected.health == nil and -math.huge or selected.health
+                    if ch > sh or (ch == sh and candidate.distance < selected.distance) then
+                        selected = candidate
+                    end
+                elseif candidate.distance < selected.distance then
+                    selected = candidate
+                end
+            end
+        end
+    end
+    return selected
+end
+
+function Feature.gateSendPets()
+    if tostring(getPlayerValue("World", "")) ~= "GatesMode" then
+        return
+    end
+    local selected = Feature.gatePickTarget()
+    if not (selected and selected.model and selected.model.Parent) then
+        return
+    end
+    -- Bay nguoi thang vao quai (nhu farm dungeon) de pet luon trong tam danh,
+    -- ke ca pet chua nhan Teleport.
+    if (selected.distance or math.huge) > 8 then
+        local character = LocalPlayer.Character
+        local root = character
+            and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+        if root and selected.root then
+            pcall(function()
+                character:PivotTo(
+                    CFrame.new(selected.root.Position + Vector3.new(0, 2, 0))
+                        * (root.CFrame - root.Position)
+                )
+            end)
+        end
+    end
+    local sendEvent = Bindable:FindFirstChild("SendPet")
+    if sendEvent then
+        pcall(function()
+            sendEvent:Fire(selected.model, true, true)
+        end)
+    end
+end
+
+function Feature.gateGoHome(reason)
+    local farm = Feature.gateFarm
+    local target = farm.homeWorld or "TimeChamber"
+    Feature.gateUpdateStatus("Auto Gate: VE", tostring(reason or "Xong lượt gate."))
+    travelToWorld(target)
+end
+
+function Feature.gateRefreshRefs()
+    -- Teleport sang server moi (gate/dungeon) lam instance cu chet: chunk van
+    -- chay nhung LocalPlayer/Remote/Bindable/Store tro toi DataModel cu.
+    -- Lam moi chung + hook lai TP Pet de farm song trong server moi.
+    pcall(function()
+        local freshPlayers = game:GetService("Players")
+        local freshPlayer = freshPlayers.LocalPlayer
+        if freshPlayer and freshPlayer ~= LocalPlayer then
+            LocalPlayer = freshPlayer
+        end
+    end)
+    pcall(function()
+        local freshRS = game:GetService("ReplicatedStorage")
+        if freshRS and freshRS ~= ReplicatedStorage then
+            ReplicatedStorage = freshRS
+            local freshRemote = freshRS:FindFirstChild("Remote")
+            if freshRemote then
+                Remote = freshRemote
+            end
+            local freshBindable = freshRS:FindFirstChild("Bindable")
+            if freshBindable then
+                Bindable = freshBindable
+            end
+            local freshStoreMod = freshRS:FindFirstChild("ModuleScripts")
+            if freshStoreMod then
+                local freshLDS = freshStoreMod:FindFirstChild("LocalDairebStore")
+                if freshLDS then
+                    local okMod, mod = pcall(require, freshLDS)
+                    if okMod and type(mod) == "table" and type(mod.GetStoreProxy) == "function" then
+                        LocalDairebStore = mod
+                        local okStore, proxy = pcall(function()
+                            return mod.GetStoreProxy("GameData")
+                        end)
+                        if okStore and proxy then
+                            Store = proxy
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    pcall(function()
+        local freshCS = game:GetService("CollectionService")
+        if freshCS and freshCS ~= CollectionService then
+            CollectionService = freshCS
+        end
+    end)
+    if Feature.tpPetEnabled then
+        Feature.applyTpPet()
+    end
+end
+
+function Feature.gateDismissVictory()
+    -- Tu dong tat man hinh VICTORY/Congratulations (MainGui.GatesModeLose)
+    -- sau khi xong gate de no khong che man hinh va khong chan luot tiep.
+    -- Nut Confirm cua game cung chi lam 2 viec: Visible=false + bo chon
+    -- gamepad, nen set thang Visible=false la du (firesignal khong co tac
+    -- dung trong executor nay).
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+    local mainGui = playerGui and playerGui:FindFirstChild("MainGui")
+    local endScreen = mainGui and mainGui:FindFirstChild("GatesModeLose")
+    if not endScreen then
+        return
+    end
+    local visible = false
+    pcall(function()
+        visible = endScreen.Visible == true
+    end)
+    if visible then
+        pcall(function()
+            endScreen.Visible = false
+        end)
+        pcall(function()
+            local confirm = endScreen:FindFirstChild("Confirm")
+            if confirm then
+                confirm.Visible = false
+            end
+        end)
+    end
+end
+
+function Feature.gateLoop(token)
+    local farm = Feature.gateFarm
+    local sendAt = 0
+    while alive() and token == farm.token and farm.enabled do
+        Feature.gateDismissVictory()
+        if os.clock() - (farm.lastRefresh or 0) >= 5 then
+            farm.lastRefresh = os.clock()
+            Feature.gateRefreshRefs()
+        end
+        local world = tostring(getPlayerValue("World", ""))
+        if world ~= "GatesMode" then
+            if farm.wasInside then
+                farm.wasInside = false
+                farm.emptySince = nil
+                farm.insideSince = nil
+                farm.seenAny = false
+                Feature.gateUpdateStatus("Auto Gate: XONG", "Xong 1 luot gate; mo gate tiep...")
+                task.wait(1)
+            end
+
+            if not farm.openEnabled then
+                if farm.phase ~= "open_off" then
+                    farm.phase = "open_off"
+                    Feature.gateUpdateStatus("Auto Gate: MO TAT", "Auto mo gate dang tat; tu mo tay hoac bat toggle.")
+                end
+                task.wait(0.5)
+            else
+            local open, runId = Feature.gateReadOpen()
+            if open then
+                farm.phase = "joining"
+                Feature.gateUpdateStatus("Auto Gate: VAO", "Gate da mo; dang equip team va vao...")
+                if tostring(getPlayerValue("World", "")) ~= "TimeChamber" then
+                    Feature.gateUpdateStatus("Auto Gate: VE", "Dang ve TimeChamber de vao gate...")
+                    travelToWorld("TimeChamber")
+                    task.wait(1)
+                else
+                    if not Feature.gateEnsureTeam(farm.teamIndex) then
+                        Feature.gateUpdateStatus("Auto Gate: TEAM", "Dang thu lai equip team...")
+                        task.wait(1)
+                    else
+                    local joined = false
+                    for _ = 1, 60 do
+                        if not alive() or token ~= farm.token or not farm.enabled then
+                            return
+                        end
+                        if tostring(getPlayerValue("World", "")) == "GatesMode" then
+                            joined = true
+                            break
+                        end
+                        local ok = pcall(function()
+                            Remote.JoinGatesMode:FireServer(runId)
+                            Bindable.AttemptTravel:Fire("GatesMode", true, runId)
+                        end)
+                        if not ok then
+                            break
+                        end
+                        task.wait(0.5)
+                    end
+                    if not joined then
+                        Feature.gateUpdateStatus("Auto Gate: CHO", "Khong vao duoc gate; thu lai...")
+                        task.wait(2)
+                    end
+                end
+                end
+            else
+                local currentId, have = Feature.gatePickGate()
+                if not currentId then
+                    Feature.gateFail("Het gate " .. tostring(farm.gateId) .. " tro xuong trong tui.")
+                    return
+                end
+                local difficulty = Feature.gateGetDifficulty(currentId)
+                if not difficulty then
+                    Feature.gateFail("Khong doc duoc do kho gate.")
+                    return
+                end
+                farm.phase = "summoning"
+                local note = ""
+                if currentId ~= farm.gateId then
+                    note = string.format(" (tam farm %s vi het %s)", tostring(currentId), tostring(farm.gateId))
+                end
+                Feature.gateUpdateStatus(
+                    "Auto Gate: MO",
+                    string.format("Dang mo MAX gate %s (con %d)...%s", tostring(currentId), have, note)
+                )
+                pcall(function()
+                    Remote.SummonGate:FireServer(difficulty, have)
+                end)
+                local deadline = os.clock() + 30
+                while alive() and token == farm.token and farm.enabled and os.clock() < deadline do
+                    if tostring(getPlayerValue("World", "")) == "GatesMode" then
+                        break
+                    end
+                    if Feature.gateReadOpen() then
+                        break
+                    end
+                    task.wait(0.5)
+                end
+            end
+            end
+            task.wait(0.5)
+        elseif not farm.farmEnabled then
+            if farm.phase ~= "farm_off" then
+                farm.phase = "farm_off"
+                Feature.gateUpdateStatus("Auto Gate: FARM TAT", "Auto farm gate dang tat; farm tay hoac bat toggle.")
+            end
+            task.wait(0.5)
+        else
+            if not farm.wasInside then
+                farm.wasInside = true
+                farm.insideSince = os.clock()
+                farm.emptySince = nil
+                farm.seenAny = false
+                farm.phase = "farming"
+                Feature.gateUpdateStatus("Auto Gate: FARM", "Dang farm trong gate...")
+                -- Equip lai team de pet respawn va nhan Teleport (TP Pet chi co
+                -- tac dung voi pet duoc goi ra sau khi bat).
+                local eq = DungeonFarm.findNativeEquipTeam()
+                if eq then
+                    pcall(function()
+                        eq(farm.teamIndex)
+                    end)
+                    task.wait(2)
+                end
+            end
+            if not farm.seenAny then
+                -- Gate dang dem gio cho (chua spawn quai): tu skip nhu nut StartNow.
+                farm.skipAt = farm.skipAt or 0
+                if os.clock() - farm.skipAt >= 5 then
+                    farm.skipAt = os.clock()
+                    pcall(function()
+                        Remote.SkipGateWait:FireServer()
+                    end)
+                end
+            end
+            if os.clock() - (sendAt or 0) >= 1 then
+                sendAt = os.clock()
+                Feature.gateSendPets()
+            end
+            -- Chi roi khi da thay quai ma sach bong 30s (tranh out oan giua wave).
+            if #Feature.gateGetEnemies() > 0 then
+                farm.seenAny = true
+                farm.emptySince = nil
+            elseif farm.seenAny then
+                farm.emptySince = farm.emptySince or os.clock()
+                if os.clock() - farm.emptySince >= 30 then
+                    Feature.gateUpdateStatus("Auto Gate: HET QUAI", "Khong con quai; roi gate...")
+                    Feature.gateGoHome("Gate sach quai.")
+                    task.wait(2)
+                end
+            end
+            if farm.insideSince and os.clock() - farm.insideSince >= 600 then
+                Feature.gateUpdateStatus("Auto Gate: HET GIO", "Qua 10 phut trong gate; roi gate...")
+                Feature.gateGoHome("Het gio trong gate.")
+                task.wait(2)
+            end
+            task.wait(0.25)
+        end
+    end
+    if token == farm.token then
+        farm.running = false
+    end
+end
+
+function Feature.gateStart()
+    local farm = Feature.gateFarm
+    if farm.running then
+        return
+    end
+    farm.token = farm.token + 1
+    local token = farm.token
+    farm.running = true
+    farm.phase = "starting"
+    farm.wasInside = tostring(getPlayerValue("World", "")) == "GatesMode"
+    farm.emptySince = nil
+    farm.insideSince = farm.wasInside and os.clock() or nil
+    if farm.wasInside then
+        farm.homeWorld = "TimeChamber"
+    else
+        local location = captureLocation()
+        farm.homeWorld = location and location.world or "TimeChamber"
+    end
+    Feature.gateUpdateStatus("Auto Gate: BAT DAU", "Bat dau auto gate...")
+    task.spawn(function()
+        protectedCall("Auto gate loop", function()
+            Feature.gateLoop(token)
+        end)
+    end)
+end
+
+function Feature.gateStop(reason)
+    local farm = Feature.gateFarm
+    farm.token = farm.token + 1
+    farm.running = false
+    farm.phase = "idle"
+    Feature.gateUpdateStatus("Auto Gate: DUNG", tostring(reason or "Da dung."))
 end
 
 local function startAutoDungeon()
@@ -6414,8 +7219,8 @@ local function buildDungeonControls()
         end
     })
     dungeonToggle = DungeonTab:Toggle({
-        Title = utf8Text("Bat Auto Dungeon", 66, 7853, 116, 32, 65, 117, 116, 111, 32, 68, 117, 110, 103, 101, 111, 110),
-        Desc = utf8Text("Chay dungeon voi cau hinh da chon", 67, 104, 7841, 121, 32, 100, 117, 110, 103, 101, 111, 110, 32, 118, 7899, 105, 32, 99, 7845, 117, 32, 104, 236, 110, 104, 32, 273, 227, 32, 99, 104, 7885, 110),
+        Title = "Auto Mo Dungeon",
+        Desc = "Tu mo dungeon + vao map khi co slot. Tat khong anh huong farm dang chay.",
         Value = false,
         Callback = function(value)
             if dungeonToggleUpdating or Feature.restoringFeatureState then
@@ -6426,9 +7231,10 @@ local function buildDungeonControls()
                 if value then
                     startAutoDungeon()
                 else
+                    -- Chi dung cho mo luot moi; farm dang chay cu de chay tiep.
                     dungeonWaiting = false
                     dungeonWaitToken = dungeonWaitToken + 1
-                    restoreDungeonSession("Da dung Auto Dungeon")
+                    DungeonFarm.updateStatus("Dungeon Farm: MO TAT", "Da tat Auto Mo; farm dang chay van tiep tuc.")
                 end
             end)
             saveConfig(true)
@@ -6471,8 +7277,8 @@ local function buildDungeonControls()
         end
     })
     dungeonFarmToggle = DungeonTab:Toggle({
-        Title = "Bat Instant Dungeon Farm",
-        Desc = "Gan thi teleport; xa thi fly noclip, active room, mo cua vang, clear enemy va chest.",
+        Title = "Auto Farm Dungeon",
+        Desc = "Gan thi teleport; xa thi fly noclip, active room, mo cua vang, clear enemy va chest. Tat khong anh huong mo dungeon.",
         Value = DungeonFarm.enabled,
         Callback = function(value)
             if DungeonFarm.toggleUpdating or Feature.restoringFeatureState then
@@ -6876,6 +7682,74 @@ Feature.autoFarmToggle = FarmTab:Toggle({
 })
 
 SettingsTab:Button({
+    Title = "Hop server it nguoi",
+    Desc = "Tu chuyen sang server public it nguoi nhat (bo qua server hien tai).",
+    Callback = function()
+        protectedCall("Hop server", function()
+            local TeleportService = game:GetService("TeleportService")
+            local placeId = game.PlaceId
+            local currentJob = game.JobId
+            notifyStatus("Hop server", "Dang tim server it nguoi...")
+            local cursor = nil
+            local best = nil
+            for _ = 1, 5 do
+                local url = string.format(
+                    "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100%s",
+                    placeId,
+                    cursor and ("&cursor=" .. tostring(cursor)) or ""
+                )
+                local ok, body = pcall(function()
+                    return game:HttpGet(url)
+                end)
+                if not ok or type(body) ~= "string" or body == "" then
+                    notifyStatus("Hop loi", "Khong lay duoc danh sach server.")
+                    return
+                end
+                local okJson, data = pcall(function()
+                    return decodeJson(body)
+                end)
+                if not okJson or type(data) ~= "table" or type(data.data) ~= "table" then
+                    notifyStatus("Hop loi", "Du lieu server khong hop le.")
+                    return
+                end
+                for _, server in ipairs(data.data) do
+                    local playing = type(server) == "table" and tonumber(server.playing)
+                    local maxPlayers = type(server) == "table" and tonumber(server.maxPlayers)
+                    if playing and maxPlayers
+                        and server.id ~= currentJob
+                        and playing < maxPlayers then
+                        -- sortOrder Asc: server dau tien du dieu kien la it nguoi nhat.
+                        best = server
+                        break
+                    end
+                end
+                if best then
+                    break
+                end
+                cursor = data.nextPageCursor
+                if type(cursor) ~= "string" or cursor == "" then
+                    break
+                end
+            end
+            if not best then
+                notifyStatus("Hop", "Khong tim duoc server trong; thu lai sau.")
+                return
+            end
+            notifyStatus(
+                "Hop server",
+                string.format("Qua server %d/%d nguoi...", tonumber(best.playing) or 0, tonumber(best.maxPlayers) or 0)
+            )
+            local okTp, err = pcall(function()
+                TeleportService:TeleportToPlaceInstance(placeId, best.id, LocalPlayer)
+            end)
+            if not okTp then
+                notifyStatus("Hop loi", tostring(err))
+            end
+        end)
+    end
+})
+
+SettingsTab:Button({
     Title = utf8Text("An menu", 7848, 110, 32, 109, 101, 110, 117),
     Desc = utf8Text("Dong menu; mo lai bang RightShift", 272, 243, 110, 103, 32, 109, 101, 110, 117, 59, 32, 109, 7903, 32, 108, 7841, 105, 32, 98, 7857, 110, 103, 32, 82, 105, 103, 104, 116, 83, 104, 105, 102, 116),
     Callback = function()
@@ -6925,7 +7799,110 @@ SettingsTab:Button({
     end
 })
 
+Feature.buildGateControls = function()
+    local farm = Feature.gateFarm
+    farm.tab = Window:Tab({
+        Title = "Auto Gate",
+        Icon = "door-open"
+    })
+    farm.tab:Paragraph({
+        Title = "Auto Gate",
+        Desc = "Chon gate va team. Tu mo MAX gate dang co, vao farm, chay den khi tat."
+    })
+    local owned = Feature.gateOwned()
+    local options = {}
+    farm.optionToId = {}
+    for _, rank in ipairs(Feature.gateRanks()) do
+        local option = string.format("%s Rank (%d)", rank.name, owned[rank.id] or 0)
+        table.insert(options, option)
+        farm.optionToId[option] = rank.id
+    end
+    local defaultGate = options[1]
+    for option, id in pairs(farm.optionToId) do
+        if id == farm.gateId then
+            defaultGate = option
+            break
+        end
+    end
+    farm.gateDropdown = farm.tab:Dropdown({
+        Title = "Gate",
+        Values = options,
+        Value = defaultGate,
+        Callback = function(value)
+            farm.gateId = farm.optionToId[value] or farm.gateId
+            saveConfig(true)
+        end
+    })
+    farm.runsSlider = nil
+    farm.amountSlider = nil
+    local teams = makeDungeonTeamOptions()
+    local defaultTeam
+    for option, index in pairs(dungeonTeamByOption) do
+        if index == farm.teamIndex then
+            defaultTeam = option
+            break
+        end
+    end
+    farm.teamDropdown = farm.tab:Dropdown({
+        Title = "Team di gate",
+        Values = teams,
+        Value = defaultTeam,
+        SearchBarEnabled = true,
+        MenuWidth = 300,
+        Callback = function(value)
+            farm.teamIndex = dungeonTeamByOption[value] or farm.teamIndex
+            saveConfig(true)
+        end
+    })
+    farm.openToggle = farm.tab:Toggle({
+        Title = "Auto Mo Gate",
+        Desc = "Tu mo MAX gate dang co, equip team, vao GatesMode. Het quai tu ve.",
+        Value = false,
+        Callback = function(value)
+            if farm.toggleUpdating or Feature.restoringFeatureState then
+                return
+            end
+            farm.openEnabled = value == true
+            Feature.gateSyncEnabled()
+            protectedCall("Auto open gate toggle", function()
+                if value then
+                    Feature.gateStart()
+                else
+                    Feature.gateToggleOff("Da tat Auto Mo Gate.")
+                end
+            end)
+            saveConfig(true)
+        end
+    })
+    farm.farmToggle = farm.tab:Toggle({
+        Title = "Auto Farm Gate",
+        Desc = "Tu bay toi quai va gui pet farm trong GatesMode.",
+        Value = false,
+        Callback = function(value)
+            if farm.toggleUpdating or Feature.restoringFeatureState then
+                return
+            end
+            farm.farmEnabled = value == true
+            Feature.gateSyncEnabled()
+            protectedCall("Auto farm gate toggle", function()
+                if value then
+                    Feature.gateStart()
+                else
+                    Feature.gateToggleOff("Da tat Auto Farm Gate.")
+                end
+            end)
+            saveConfig(true)
+        end
+    })
+    farm.statusParagraph = farm.tab:Button({
+        Title = "Auto Gate: SAN SANG",
+        Desc = "Chon gate, so luong, team roi bat toggle.",
+        Callback = function() end
+    })
+end
+
 protectedCall("Build dungeon controls", buildDungeonControls)
+protectedCall("Build gate controls", Feature.buildGateControls)
 protectedCall("Build auto passive controls", AutoPassive.buildAutoPassiveControls)
 
 local function selectMapped(dropdown, mapping, wanted)
@@ -7150,6 +8127,59 @@ Feature.applySavedState = function()
         Feature.attackWhileUltEnabled = true
         setToggleSilently(Feature.attackWhileUltToggle, true, function(value)
             Feature.attackWhileUltToggleUpdating = value
+        end)
+    end
+    local gateFarm = Feature.gateFarm
+    setToggleSilently(gateFarm.openToggle, false, function(value)
+        gateFarm.toggleUpdating = value
+    end)
+    setToggleSilently(gateFarm.farmToggle, false, function(value)
+        gateFarm.toggleUpdating = value
+    end)
+    gateFarm.openEnabled = false
+    gateFarm.farmEnabled = false
+    Feature.gateSyncEnabled()
+    if type(gateFarm.optionToId) == "table" then
+        local wantGate
+        for option, id in pairs(gateFarm.optionToId) do
+            if id == gateFarm.gateId then
+                wantGate = option
+                break
+            end
+        end
+        if wantGate and gateFarm.gateDropdown then
+            pcall(function()
+                gateFarm.gateDropdown:Select(wantGate)
+            end)
+        end
+    end
+    selectMapped(gateFarm.teamDropdown, dungeonTeamByOption, gateFarm.teamIndex)
+    if gateFarm.amountSlider then
+        pcall(function()
+            gateFarm.amountSlider:Set(gateFarm.amount)
+        end)
+    end
+    if gateFarm.runsSlider then
+        pcall(function()
+            gateFarm.runsSlider:Set(gateFarm.maxRuns)
+        end)
+    end
+    if desired.autoGateOpen then
+        gateFarm.openEnabled = true
+        setToggleSilently(gateFarm.openToggle, true, function(value)
+            gateFarm.toggleUpdating = value
+        end)
+    end
+    if desired.autoGateFarm then
+        gateFarm.farmEnabled = true
+        setToggleSilently(gateFarm.farmToggle, true, function(value)
+            gateFarm.toggleUpdating = value
+        end)
+    end
+    if desired.autoGateOpen or desired.autoGateFarm then
+        Feature.gateSyncEnabled()
+        task.spawn(function()
+            protectedCall("Start saved auto gate", Feature.gateStart)
         end)
     end
     Feature.updateMainStatus(true)
