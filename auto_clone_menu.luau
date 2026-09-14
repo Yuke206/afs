@@ -9,6 +9,10 @@ pcall(function()
     if oldStatus then
         oldStatus:Destroy()
     end
+    local oldDungeonMap = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("AutoDungeonMap")
+    if oldDungeonMap then
+        oldDungeonMap:Destroy()
+    end
 end)
 local globalEnv = getgenv()
 globalEnv.__auto_clone_state = globalEnv.__auto_clone_state or {generation = 0}
@@ -78,6 +82,11 @@ local Window = WindUI:CreateWindow({
     Resizable = true,
     HideSearchBar = true,
     ToggleKey = Enum.KeyCode.RightShift
+})
+
+local MainTab = Window:Tab({
+    Title = "Main",
+    Icon = "home"
 })
 
 local CloneTab = Window:Tab({
@@ -297,6 +306,12 @@ local optionByUID = {}
 local petDropdown
 local autoEnabled = false
 local Feature = {
+    autoCollectDropsEnabled = false,
+    autoCollectDropsToggle = nil,
+    autoCollectDropsToggleUpdating = false,
+    mainStatusParagraph = nil,
+    mainStatusLastUpdate = 0,
+    mainSeenDrops = setmetatable({}, {__mode = "k"}),
     autoCloneToggle = nil,
     autoCloneToggleUpdating = false,
     autoFarmEnabled = false,
@@ -386,7 +401,8 @@ local dungeonFinishConnection
 local dungeonMapDropdown
 local dungeonModeDropdown
 local dungeonSizeDropdown
-local dungeonTeamDropdown
+local dungeonNormalTeamDropdown
+local dungeonGoldTeamDropdown
 local dungeonSecondArtifactDropdown
 local dungeonToggle
 local dungeonToggleUpdating = false
@@ -407,13 +423,30 @@ local DungeonFarm = {
     lastEnemyCount = 0,
     completed = {},
     attempts = {},
+    goldRooms = {},
     goldDoorsOpened = {},
     goldRoomsOpened = {},
     completedChests = {},
     enemyHealthProbeAt = {},
     enemySeenAt = {},
+    route = {},
+    routeKey = "",
+    routeTarget = nil,
+    goldTargetKey = nil,
+    goldTargetRoom = nil,
+    goldRoomKeys = {},
+    goldContentActive = false,
+    routeFolder = nil,
+    mapGui = nil,
+    mapPanel = nil,
+    mapTitle = nil,
+    mapSummary = nil,
+    mapCanvas = nil,
+    mapLegend = nil,
     teamApplied = false,
     teamApplying = false,
+    teamIndexApplied = nil,
+    deadEnemies = {},
     teleportDistance = 120,
     flySpeed = 140,
     teleportDistanceSlider = nil,
@@ -451,12 +484,31 @@ local dungeonSelection = {
     mode = "Public",
     size = 1,
     teamIndex = 1,
+    normalTeamIndex = 1,
+    goldTeamIndex = 1,
     secondArtifact = ""
 }
 local scanPets
 local rebuildPetDropdowns
 local selectedCount
 local syncDungeonControls
+
+local function normalizeDungeonMapId(value)
+    if type(value) ~= "string" or value == "" then
+        return nil
+    end
+    if type(WorldData[value]) == "table" then
+        return value
+    end
+
+    -- Older config files stored the display option instead of the world id.
+    local id = value:match("%[([^%]]+)%]%s*$")
+        or value:match("%[([^%]]+)%s*$")
+    if id and type(WorldData[id]) == "table" then
+        return id
+    end
+    return nil
+end
 
 function Feature.modeLabel(mode)
     if mode == Feature.MODE_LOWEST_HEALTH then
@@ -1061,7 +1113,8 @@ local function saveConfig(silent)
                 autoDungeon = Feature.autoDungeonEnabled,
                 autoDungeonFarm = DungeonFarm.enabled,
                 autoFarm = Feature.autoFarmEnabled,
-                autoPassive = Feature.autoPassiveEnabled
+                autoPassive = Feature.autoPassiveEnabled,
+                autoCollectDrops = Feature.autoCollectDropsEnabled
             },
             autoFarm = {
                 mode = Feature.autoFarmMode
@@ -1119,7 +1172,8 @@ local function loadConfig()
             autoDungeon = data.features.autoDungeon == true,
             autoDungeonFarm = data.features.autoDungeonFarm ~= false,
             autoFarm = data.features.autoFarm == true,
-            autoPassive = data.features.autoPassive == true
+            autoPassive = data.features.autoPassive == true,
+            autoCollectDrops = data.features.autoCollectDrops == true
         }
     end
     if type(data.autoFarm) == "table" then
@@ -1210,13 +1264,30 @@ local function loadConfig()
         Feature.autoPassiveRollDelay = AutoPassive.normalizeRollDelay(autoData.rollDelay)
     end
 
-    if type(data.dungeonSelection) == "table" then
-        for key, value in pairs(data.dungeonSelection) do
+    local savedDungeonSelection = type(data.dungeonSelection) == "table"
+        and data.dungeonSelection
+        or nil
+    local savedNormalTeam = savedDungeonSelection
+        and type(savedDungeonSelection.normalTeamIndex) == "number"
+    local savedGoldTeam = savedDungeonSelection
+        and type(savedDungeonSelection.goldTeamIndex) == "number"
+    if savedDungeonSelection then
+        for key, value in pairs(savedDungeonSelection) do
             if dungeonSelection[key] ~= nil and type(value) == type(dungeonSelection[key]) then
                 dungeonSelection[key] = value
             end
         end
     end
+    if not savedNormalTeam then
+        dungeonSelection.normalTeamIndex = tonumber(dungeonSelection.teamIndex) or 1
+        configNeedsMigration = true
+    end
+    if not savedGoldTeam then
+        dungeonSelection.goldTeamIndex = dungeonSelection.normalTeamIndex
+        configNeedsMigration = true
+    end
+    dungeonSelection.teamIndex = dungeonSelection.normalTeamIndex
+    dungeonSelection.mapId = normalizeDungeonMapId(dungeonSelection.mapId) or "DBZ"
     if type(data.dungeonFarm) == "table" then
         DungeonFarm.teleportDistance = DungeonFarm.normalizeTeleportDistance(data.dungeonFarm.teleportDistance)
         DungeonFarm.flySpeed = DungeonFarm.normalizeFlySpeed(data.dungeonFarm.flySpeed)
@@ -2673,6 +2744,86 @@ function Feature.step()
     Feature.updateStatus()
 end
 
+function Feature.isDropModel(model)
+    if not model
+        or not model:IsA("Model")
+        or not model.PrimaryPart
+        or model.Name == "MovingItem" then
+        return false
+    end
+
+    local base = model:FindFirstChild("Base")
+    if not base then
+        return false
+    end
+
+    if model:FindFirstChild("ItemPart") then
+        return true
+    end
+    if model:FindFirstChild("Item") then
+        return true
+    end
+    if model:FindFirstChild("Core") and model:FindFirstChild("Aura") then
+        return true
+    end
+
+    local coin = model:FindFirstChild("Coin")
+    if coin and not model:FindFirstChild("Glow") then
+        return true
+    end
+    return false
+end
+
+function Feature.collectDropsStep()
+    if not Feature.autoCollectDropsEnabled then
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local playerRoot = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    local effects = workspace:FindFirstChild("Effects")
+    if not playerRoot or not effects then
+        return
+    end
+
+    for _, model in ipairs(effects:GetChildren()) do
+        if Feature.isDropModel(model) and not Feature.mainSeenDrops[model] then
+            local moved = pcall(function()
+                model:PivotTo(playerRoot.CFrame)
+            end)
+            if not moved then
+                moved = pcall(function()
+                    model:SetPrimaryPartCFrame(playerRoot.CFrame)
+                end)
+            end
+            if moved then
+                Feature.mainSeenDrops[model] = true
+            end
+        end
+    end
+end
+
+function Feature.updateMainStatus(force)
+    if not Feature.mainStatusParagraph then
+        return
+    end
+    local now = os.clock()
+    if not force and now - Feature.mainStatusLastUpdate < 0.4 then
+        return
+    end
+    Feature.mainStatusLastUpdate = now
+    setParagraph(
+        Feature.mainStatusParagraph,
+        "Main | Collect drop: " .. (Feature.autoCollectDropsEnabled and "BAT" or "TAT"),
+        "Auto collect drop khong gioi han khoang cach."
+    )
+end
+
+function Feature.mainStep()
+    Feature.collectDropsStep()
+    Feature.updateMainStatus(false)
+end
+
 local function openCloneGui()
     local bindable = ReplicatedStorage:FindFirstChild("Bindable")
     local event = bindable and bindable:FindFirstChild("AttemptCloneMachine")
@@ -2688,6 +2839,32 @@ local function openCloneGui()
             end
         end
     end
+end
+
+local function openDupeMachineGui()
+    local mainGui = LocalPlayer.PlayerGui:FindFirstChild("MainGui")
+    local bindable = ReplicatedStorage:FindFirstChild("Bindable")
+    local chooser = bindable and bindable:FindFirstChild("ChooseDupeMachine")
+    local opener = mainGui and mainGui:FindFirstChild("SetWindowOpen")
+    if not chooser or not opener then
+        notifyStatus("Dupe Machine", "Khong tim thay duong mo GUI Dupe Machine.")
+        return
+    end
+
+    local machineNumber = 1
+    local ok, tagged = pcall(function()
+        return CollectionService:GetTagged("DupeMachine")
+    end)
+    if ok and type(tagged) == "table" and tagged[1] then
+        local value = tagged[1]:GetAttribute("MachineNumber")
+        if value ~= nil then
+            machineNumber = value
+        end
+    end
+
+    chooser:Fire(machineNumber)
+    opener:Fire("DupeMachine", true)
+    notifyStatus("Dupe Machine", "Da mo GUI Dupe Machine.")
 end
 
 local function openArtifactGui()
@@ -2900,16 +3077,117 @@ local function applyEquippedPets(desired)
     return true
 end
 
+function DungeonFarm.getTeamSlotUID(team, slot)
+    local uids = type(team) == "table" and team.UIDs or nil
+    if type(uids) ~= "table" then
+        return nil
+    end
+    return uids[slot] or uids[tostring(slot)]
+end
+
+function DungeonFarm.getEquipSlotCount()
+    local amount = 0
+    pcall(function()
+        amount = tonumber(GetMultiplier.EquipAmount(LocalPlayer)) or 0
+    end)
+    return math.max(0, math.floor(amount))
+end
+
+function DungeonFarm.normalizedUID(value)
+    if value == nil or value == false or tostring(value) == "" then
+        return ""
+    end
+    return tostring(value)
+end
+
+function DungeonFarm.teamPetsMatch(team)
+    local amount = DungeonFarm.getEquipSlotCount()
+    if amount < 1 then
+        return false
+    end
+    local equipped = getStoreTable("EquippedPets", true)
+    for slot = 1, amount do
+        local actual = equipped[tostring(slot)] or equipped[slot]
+        if DungeonFarm.normalizedUID(actual) ~= DungeonFarm.normalizedUID(DungeonFarm.getTeamSlotUID(team, slot)) then
+            return false
+        end
+    end
+    return true
+end
+
+function DungeonFarm.teamLoadoutMatches(team)
+    local loadout = type(team) == "table" and team.Loadout or nil
+    if type(loadout) ~= "table" then
+        return true
+    end
+
+    local fields = {
+        {source = "Title", store = "CurrentTitle"},
+        {source = "Avatar", store = "CurrentAvatar"},
+        {source = "Aura", store = "CurrentAura"},
+        {source = "Artefact", store = "CurrentArtefact"},
+        {source = "SecondArtefact", store = "CurrentSecondArtefact"}
+    }
+    for _, field in ipairs(fields) do
+        if loadout[field.source] ~= nil
+            and cleanText(getStoreValue(field.store, true, "") or "")
+                ~= cleanText(loadout[field.source]) then
+            return false
+        end
+    end
+    return true
+end
+
+function DungeonFarm.findNativeEquipTeam()
+    if type(filtergc) ~= "function" then
+        return nil, "filtergc API khong ton tai trong executor."
+    end
+    local ok, callback = pcall(function()
+        return filtergc("function", {
+            Name = "equip_team",
+            IgnoreExecutor = true
+        }, true)
+    end)
+    if not ok or type(callback) ~= "function" then
+        return nil, "Khong tim thay handler native equip_team."
+    end
+    return callback
+end
+
 local function applyDungeonTeam(index)
+    index = tonumber(index)
+    if not index then
+        return false, "Team dungeon khong hop le."
+    end
+    index = math.max(1, math.floor(index))
+
     local team = getStoreTable("PetTeams", true)[index]
-    if type(team) ~= "table" then
+    if type(team) ~= "table" or type(team.UIDs) ~= "table" then
         return false, "Khong tim thay team dungeon."
     end
-    local applied, reason = applyEquippedPets(team.UIDs or {})
-    if not applied then
+
+    local equipTeam, reason = DungeonFarm.findNativeEquipTeam()
+    if not equipTeam then
         return false, reason
     end
-    return team
+
+    for attempt = 1, 10 do
+        local called, callError = pcall(function()
+            equipTeam(index)
+        end)
+        if not called then
+            return false, "Goi native equip_team loi: " .. tostring(callError)
+        end
+        task.wait(0.35)
+        if DungeonFarm.teamPetsMatch(team) and DungeonFarm.teamLoadoutMatches(team) then
+            return true, team
+        end
+        if attempt < 10 then
+            task.wait(0.25)
+        end
+    end
+
+    return false, "Native equip_team chua dong bo du pet va loadout cua team."
 end
 
 local function applyDungeonTitle(title, force)
@@ -2994,31 +3272,73 @@ local function applyDungeonLoadout(loadout)
     end
 end
 
-function DungeonFarm.ensureTeamApplied()
-    if DungeonFarm.teamApplied then
-        return true
+function DungeonFarm.ensureTeamApplied(index, role)
+    index = tonumber(index)
+        or tonumber(dungeonSelection.normalTeamIndex)
+        or tonumber(dungeonSelection.teamIndex)
+        or 1
+    index = math.max(1, math.floor(index))
+
+    if DungeonFarm.teamApplied and DungeonFarm.teamIndexApplied == index then
+        local team = getStoreTable("PetTeams", true)[index]
+        if type(team) == "table"
+            and DungeonFarm.teamPetsMatch(team)
+            and DungeonFarm.teamLoadoutMatches(team) then
+            return true
+        end
     end
     if DungeonFarm.teamApplying then
-        local deadline = os.clock() + 10
+        local deadline = os.clock() + 15
         while alive() and DungeonFarm.teamApplying and os.clock() < deadline do
             task.wait(0.1)
         end
-        return DungeonFarm.teamApplied
+        if DungeonFarm.teamApplied and DungeonFarm.teamIndexApplied == index then
+            local team = getStoreTable("PetTeams", true)[index]
+            if type(team) == "table"
+                and DungeonFarm.teamPetsMatch(team)
+                and DungeonFarm.teamLoadoutMatches(team) then
+                return true
+            end
+        end
     end
 
     DungeonFarm.teamApplying = true
-    local ok, team = protectedCall("Apply dungeon team", function()
-        return applyDungeonTeam(dungeonSelection.teamIndex)
+    local ok, team = protectedCall("Apply dungeon " .. tostring(role or "team"), function()
+        local applied, reason = applyDungeonTeam(index)
+        if not applied then
+            error(reason)
+        end
+        return reason
     end)
-    if ok and team then
-        protectedCall("Apply dungeon team loadout", function()
-            applyDungeonLoadout(team.Loadout)
-        end)
-        DungeonFarm.teamApplied = true
-        DungeonFarm.lastMessage = "Da doi sang team dungeon sau khi vao map."
-    end
     DungeonFarm.teamApplying = false
-    return DungeonFarm.teamApplied
+    if ok and type(team) == "table" then
+        DungeonFarm.teamApplied = true
+        DungeonFarm.teamIndexApplied = index
+        DungeonFarm.lastMessage = "Da doi sang team " .. tostring(role or "dungeon") .. "."
+        return true
+    end
+    DungeonFarm.teamApplied = false
+    DungeonFarm.teamIndexApplied = nil
+    return false
+end
+
+function DungeonFarm.getRoomTeamIndex(room)
+    if DungeonFarm.goldRoomKeys[room and room:GetFullName() or ""] then
+        return tonumber(dungeonSelection.goldTeamIndex)
+            or tonumber(dungeonSelection.normalTeamIndex)
+            or tonumber(dungeonSelection.teamIndex)
+            or 1,
+            "gold"
+    end
+    return tonumber(dungeonSelection.normalTeamIndex)
+        or tonumber(dungeonSelection.teamIndex)
+        or 1,
+        "normal"
+end
+
+function DungeonFarm.ensureRoomTeam(room)
+    local index, role = DungeonFarm.getRoomTeamIndex(room)
+    return DungeonFarm.ensureTeamApplied(index, role)
 end
 
 local function getDungeonCooldownInfo()
@@ -3073,10 +3393,22 @@ function DungeonFarm.getDungeon()
     return worlds and worlds:FindFirstChild("Dungeon")
 end
 
+function DungeonFarm.getDungeonActiveFlag(dungeon)
+    if not dungeon then
+        return false
+    end
+    local active = dungeon:GetAttribute("Active")
+    if active == nil then
+        local activeValue = dungeon:FindFirstChild("Active")
+        active = activeValue and activeValue.Value
+    end
+    return active == true
+end
+
 function DungeonFarm.getActiveDungeonInfo()
     local worlds = workspace:FindFirstChild("Worlds")
     local dungeon = worlds and worlds:FindFirstChild("Dungeon")
-    if dungeon and dungeon:GetAttribute("Active") == true then
+    if dungeon and DungeonFarm.getDungeonActiveFlag(dungeon) then
         local ownerValue = dungeon:FindFirstChild("FriendsWithUserId")
         local ownerId = ownerValue and tonumber(ownerValue.Value) or 0
         -- Ignore a stale Active flag when the server has no live dungeon owner.
@@ -3105,23 +3437,42 @@ function DungeonFarm.isDungeonOccupied()
     return true, ownerId
 end
 
+function DungeonFarm.getRoomConfirmPrompt(room)
+    if not room or not room.Parent then
+        return nil
+    end
+    for _, object in ipairs(room:GetDescendants()) do
+        if object:IsA("ProximityPrompt") and object.Enabled then
+            local part = object.Parent
+            if part and part:IsA("BasePart") and part.Name == "ConfirmPart" then
+                return object, part
+            end
+        end
+    end
+    return nil
+end
+
 function DungeonFarm.findPrompt(dungeon)
-    local map = dungeon and dungeon:FindFirstChild("Map")
-    if not map then
+    local rooms, startEntry, goldEntry = DungeonFarm.rebuildRoute(dungeon)
+    if #DungeonFarm.route > 0 and startEntry and goldEntry then
+        -- Only use rooms on the shortest route to the selected gold room.
+        for _, entry in ipairs(DungeonFarm.route) do
+            if entry.room.Parent and not DungeonFarm.completed[entry.key] then
+                local prompt, part = DungeonFarm.getRoomConfirmPrompt(entry.room)
+                if prompt then
+                    return prompt, entry.room, part, entry.key
+                end
+            end
+        end
         return nil
     end
 
-    for _, object in ipairs(map:GetDescendants()) do
-        if object:IsA("ProximityPrompt") and object.Enabled then
-            local part = object.Parent
-            local room = part and part.Parent
-            if part and part.Name == "ConfirmPart"
-                and room and room:IsA("Model")
-                and room:GetAttribute("MapPos") ~= nil then
-                local key = room:GetFullName()
-                if not DungeonFarm.completed[key] then
-                    return object, room, part, key
-                end
+    -- Wait for the native map/door data when a route is not available yet.
+    for _, entry in ipairs(rooms) do
+        if entry.room.Parent and not DungeonFarm.completed[entry.key] then
+            local prompt, part = DungeonFarm.getRoomConfirmPrompt(entry.room)
+            if prompt then
+                return prompt, entry.room, part, entry.key
             end
         end
     end
@@ -3183,6 +3534,571 @@ function DungeonFarm.findRoom(instance, map)
     return nil
 end
 
+function DungeonFarm.getMapCoordinate(room)
+    if not room then
+        return nil, nil
+    end
+    local value = room:GetAttribute("MapPos")
+    if typeof(value) == "Vector2" then
+        return math.floor(value.X + 0.5), math.floor(value.Y + 0.5)
+    end
+    local x, y = tostring(value or room.Name):match("^%s*(%-?%d+)%s*,%s*(%-?%d+)%s*$")
+    return tonumber(x), tonumber(y)
+end
+
+function DungeonFarm.getRoomCenter(room)
+    if not room then
+        return nil
+    end
+    local rootPart = room:FindFirstChild("RootPart")
+    if rootPart and rootPart:IsA("BasePart") then
+        return rootPart.Position
+    end
+    local ok, pivot = pcall(function()
+        return room:GetPivot()
+    end)
+    return ok and pivot and pivot.Position or nil
+end
+
+function DungeonFarm.isGoldDoorPart(part)
+    if not (part and part:IsA("BasePart") and part.Name == "Door") then
+        return false
+    end
+    local color = part.Color
+    return math.abs(color.R - 0.85098) <= 0.03
+        and math.abs(color.G - 0.713726) <= 0.03
+        and math.abs(color.B - 0.219608) <= 0.03
+end
+
+function DungeonFarm.getRouteRooms(dungeon)
+    local map = dungeon and dungeon:FindFirstChild("Map")
+    local model = map and map:FindFirstChild("Model")
+    local rooms = {}
+    local byCoordinate = {}
+    if not model then
+        return rooms, byCoordinate
+    end
+
+    for _, room in ipairs(model:GetChildren()) do
+        if room:IsA("Model") then
+            local x, y = DungeonFarm.getMapCoordinate(room)
+            local center = DungeonFarm.getRoomCenter(room)
+            if x and y and center then
+                local entry = {
+                    room = room,
+                    key = room:GetFullName(),
+                    x = x,
+                    y = y,
+                    center = center,
+                    neighbors = {}
+                }
+                table.insert(rooms, entry)
+                byCoordinate[tostring(x) .. ":" .. tostring(y)] = entry
+            end
+        end
+    end
+    return rooms, byCoordinate
+end
+
+function DungeonFarm.getNativeMapFrame()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local mainGui = playerGui and playerGui:FindFirstChild("MainGui")
+    local minimap = mainGui and mainGui:FindFirstChild("DungeonMinimap")
+    return minimap and minimap:FindFirstChild("MapFrame")
+end
+
+function DungeonFarm.getNativeMapCells()
+    local mapFrame = DungeonFarm.getNativeMapFrame()
+    local cells = {}
+    if not mapFrame then
+        return nil, cells
+    end
+
+    for _, object in ipairs(mapFrame:GetChildren()) do
+        if object:IsA("GuiObject") then
+            local x, y = tostring(object.Name):match("^%s*(%-?%d+),%s*(%-?%d+)%s*$")
+            if x and y then
+                cells[tostring(tonumber(x)) .. ":" .. tostring(tonumber(y))] = object
+            end
+        end
+    end
+    return mapFrame, cells
+end
+
+function DungeonFarm.isNativeGoldCell(cell)
+    if not (cell and cell:IsA("GuiObject")) then
+        return false
+    end
+    local color = cell.BackgroundColor3
+    return math.abs(color.R - 198 / 255) <= 0.02
+        and math.abs(color.G - 191 / 255) <= 0.02
+        and math.abs(color.B - 134 / 255) <= 0.02
+end
+
+function DungeonFarm.findGoldRoomsFromMap(dungeon, rooms)
+    local result = {}
+    local nativeMap, nativeCells = DungeonFarm.getNativeMapCells()
+    local hasNativeCells = nativeMap ~= nil and next(nativeCells) ~= nil
+    for _, entry in ipairs(rooms) do
+        local cell = nativeCells[tostring(entry.x) .. ":" .. tostring(entry.y)]
+        local isGold = DungeonFarm.isNativeGoldCell(cell)
+        if not isGold and not cell or not hasNativeCells then
+            isGold = false
+            for _, object in ipairs(entry.room:GetDescendants()) do
+                if DungeonFarm.isGoldDoorPart(object) then
+                    isGold = true
+                    break
+                end
+            end
+        end
+        if isGold then
+            table.insert(result, entry)
+        end
+    end
+    return result
+end
+
+function DungeonFarm.findGoldRoomFromMap(dungeon, rooms)
+    return DungeonFarm.findGoldRoomsFromMap(dungeon, rooms)[1]
+end
+
+function DungeonFarm.findCurrentMapRoom(rooms)
+    local character = LocalPlayer.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if root then
+        local nearest
+        local nearestDistance = math.huge
+        for _, entry in ipairs(rooms) do
+            local distance = (entry.center - root.Position).Magnitude
+            if distance < nearestDistance then
+                nearest = entry
+                nearestDistance = distance
+            end
+        end
+        return nearest
+    end
+
+    local targetRoom = DungeonFarm.targetRoom
+    if targetRoom and targetRoom.Parent then
+        for _, entry in ipairs(rooms) do
+            if entry.room == targetRoom then
+                return entry
+            end
+        end
+    end
+    return nil
+end
+
+function DungeonFarm.rebuildRoute(dungeon)
+    local rooms, byCoordinate = DungeonFarm.getRouteRooms(dungeon)
+    local startEntry = DungeonFarm.findCurrentMapRoom(rooms)
+    local goldEntries = DungeonFarm.findGoldRoomsFromMap(dungeon, rooms)
+    DungeonFarm.goldRooms = goldEntries
+    DungeonFarm.goldRoomKeys = {}
+    local entryByKey = {}
+    for _, entry in ipairs(rooms) do
+        entryByKey[entry.key] = entry
+    end
+    for _, entry in ipairs(goldEntries) do
+        DungeonFarm.goldRoomKeys[entry.key] = true
+    end
+
+    local function linkByCoordinate(entry, nextX, nextY)
+        local neighbour = byCoordinate[tostring(nextX) .. ":" .. tostring(nextY)]
+        if neighbour and neighbour ~= entry then
+            entry.neighbors[neighbour.key] = neighbour
+            neighbour.neighbors[entry.key] = entry
+            return true
+        end
+        return false
+    end
+
+    local nativeMap, nativeCells = DungeonFarm.getNativeMapCells()
+    local nativeDoorCount = 0
+    local physicalDoorCount = 0
+    local nativeDirections = {
+        {1, 0},
+        {0, 1},
+        {-1, 0},
+        {0, -1}
+    }
+
+    for _, entry in ipairs(rooms) do
+        local cell = nativeCells[tostring(entry.x) .. ":" .. tostring(entry.y)]
+        if nativeMap and cell then
+            for direction, offset in ipairs(nativeDirections) do
+                local marker = cell:FindFirstChild("Door" .. tostring(direction))
+                if marker and marker:IsA("GuiObject") then
+                    nativeDoorCount = nativeDoorCount + 1
+                    linkByCoordinate(entry, entry.x + offset[1], entry.y + offset[2])
+                end
+            end
+        end
+
+        -- Physical Door models cover clients where the minimap has not rendered yet.
+        for _, object in ipairs(entry.room:GetChildren()) do
+            local direction = object:IsA("Model") and object.Name:match("^Door([1-4])$")
+            if direction then
+                local directionIndex = tonumber(direction)
+                local offset = directionIndex and nativeDirections[directionIndex]
+                if offset then
+                    physicalDoorCount = physicalDoorCount + 1
+                    linkByCoordinate(entry, entry.x + offset[1], entry.y + offset[2])
+                end
+            elseif object:IsA("BasePart") and object.Name == "Door" then
+                physicalDoorCount = physicalDoorCount + 1
+                local delta = object.Position - entry.center
+                local nextX, nextY
+                if math.abs(delta.X) >= math.abs(delta.Z) then
+                    nextX = entry.x + (delta.X >= 0 and 1 or -1)
+                    nextY = entry.y
+                else
+                    nextX = entry.x
+                    nextY = entry.y + (delta.Z >= 0 and 1 or -1)
+                end
+                linkByCoordinate(entry, nextX, nextY)
+            end
+        end
+    end
+
+    local function sortedNeighbours(entry)
+        local result = {}
+        for _, neighbour in pairs(entry.neighbors) do
+            table.insert(result, neighbour)
+        end
+        table.sort(result, function(a, b)
+            return a.key < b.key
+        end)
+        return result
+    end
+
+    local function shortestDistances(root)
+        local distances = {}
+        local previous = {}
+        if not root then
+            return distances, previous
+        end
+        distances[root.key] = 0
+        previous[root.key] = false
+        local queue = {root}
+        local head = 1
+        while head <= #queue do
+            local current = queue[head]
+            head = head + 1
+            for _, neighbour in ipairs(sortedNeighbours(current)) do
+                if distances[neighbour.key] == nil then
+                    distances[neighbour.key] = distances[current.key] + 1
+                    previous[neighbour.key] = current.key
+                    table.insert(queue, neighbour)
+                end
+            end
+        end
+        return distances, previous
+    end
+
+    local distances = shortestDistances(startEntry)
+    local goldEntry = DungeonFarm.goldTargetKey and entryByKey[DungeonFarm.goldTargetKey] or nil
+    if not goldEntry then
+        local bestDistance = math.huge
+        local bestTie = math.huge
+        for _, entry in ipairs(goldEntries) do
+            local distance = distances[entry.key]
+            if distance ~= nil then
+                local tie = startEntry
+                    and math.abs(entry.x - startEntry.x) + math.abs(entry.y - startEntry.y)
+                    or math.huge
+                if distance < bestDistance
+                    or distance == bestDistance and (tie < bestTie or tie == bestTie and entry.key < (goldEntry and goldEntry.key or "~")) then
+                    bestDistance = distance
+                    bestTie = tie
+                    goldEntry = entry
+                end
+            end
+        end
+        if goldEntry then
+            DungeonFarm.goldTargetKey = goldEntry.key
+        end
+    end
+
+    DungeonFarm.goldTargetRoom = goldEntry and goldEntry.room or nil
+    local startKey = startEntry and startEntry.key or ""
+    local targetKey = goldEntry and goldEntry.key or ""
+    local routeKey = table.concat({
+        startKey,
+        targetKey,
+        tostring(#rooms),
+        tostring(nativeDoorCount),
+        tostring(physicalDoorCount)
+    }, "|")
+    if routeKey == DungeonFarm.routeKey then
+        return rooms, startEntry, goldEntry
+    end
+    DungeonFarm.routeKey = routeKey
+    DungeonFarm.routeTarget = goldEntry and goldEntry.room or nil
+    DungeonFarm.route = {}
+
+    if not (startEntry and goldEntry) then
+        return rooms, startEntry, goldEntry
+    end
+
+    local _, previous = shortestDistances(startEntry)
+    if previous[goldEntry.key] == nil then
+        return rooms, startEntry, goldEntry
+    end
+
+    local reversed = {}
+    local key = goldEntry.key
+    while key do
+        local entry = entryByKey[key]
+        if not entry then
+            break
+        end
+        table.insert(reversed, entry)
+        key = previous[key]
+    end
+    for index = #reversed, 1, -1 do
+        table.insert(DungeonFarm.route, reversed[index])
+    end
+    return rooms, startEntry, goldEntry
+end
+
+function DungeonFarm.ensureMapOverlay()
+    if DungeonFarm.mapGui and DungeonFarm.mapGui.Parent then
+        return DungeonFarm.mapGui
+    end
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not playerGui then
+        return nil
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AutoDungeonMap"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 998
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = playerGui
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.AnchorPoint = Vector2.new(1, 0)
+    panel.Position = UDim2.new(1, -12, 0, 170)
+    panel.Size = UDim2.fromOffset(330, 370)
+    panel.BackgroundColor3 = Color3.fromRGB(21, 24, 31)
+    panel.BackgroundTransparency = 0.08
+    panel.BorderSizePixel = 0
+    panel.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = panel
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(82, 94, 116)
+    stroke.Transparency = 0.25
+    stroke.Parent = panel
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(12, 8)
+    title.Size = UDim2.new(1, -24, 0, 25)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 15
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = panel
+
+    local summary = Instance.new("TextLabel")
+    summary.BackgroundTransparency = 1
+    summary.Position = UDim2.fromOffset(12, 34)
+    summary.Size = UDim2.new(1, -24, 0, 34)
+    summary.Font = Enum.Font.Gotham
+    summary.TextSize = 11
+    summary.TextColor3 = Color3.fromRGB(190, 199, 214)
+    summary.TextWrapped = true
+    summary.TextXAlignment = Enum.TextXAlignment.Left
+    summary.TextYAlignment = Enum.TextYAlignment.Top
+    summary.Parent = panel
+
+    local canvas = Instance.new("Frame")
+    canvas.Name = "Canvas"
+    canvas.Position = UDim2.fromOffset(10, 75)
+    canvas.Size = UDim2.new(1, -20, 0, 260)
+    canvas.BackgroundColor3 = Color3.fromRGB(12, 14, 19)
+    canvas.BorderSizePixel = 0
+    canvas.ClipsDescendants = true
+    canvas.Parent = panel
+    local canvasCorner = Instance.new("UICorner")
+    canvasCorner.CornerRadius = UDim.new(0, 7)
+    canvasCorner.Parent = canvas
+
+    local legend = Instance.new("TextLabel")
+    legend.BackgroundTransparency = 1
+    legend.Position = UDim2.fromOffset(12, 342)
+    legend.Size = UDim2.new(1, -24, 0, 20)
+    legend.Font = Enum.Font.Gotham
+    legend.TextSize = 11
+    legend.TextColor3 = Color3.fromRGB(175, 185, 202)
+    legend.TextXAlignment = Enum.TextXAlignment.Left
+    legend.Parent = panel
+
+    DungeonFarm.mapGui = gui
+    DungeonFarm.mapPanel = panel
+    DungeonFarm.mapTitle = title
+    DungeonFarm.mapSummary = summary
+    DungeonFarm.mapCanvas = canvas
+    DungeonFarm.mapLegend = legend
+    return gui
+end
+
+function DungeonFarm.renderMapOverlay(dungeon)
+    local gui = DungeonFarm.ensureMapOverlay()
+    if not gui then
+        return
+    end
+    gui.Enabled = true
+    local canvas = DungeonFarm.mapCanvas
+    if not canvas then
+        return
+    end
+    for _, child in ipairs(canvas:GetChildren()) do
+        child:Destroy()
+    end
+
+    local rooms, startEntry, goldEntry = DungeonFarm.rebuildRoute(dungeon)
+    if #rooms == 0 then
+        DungeonFarm.mapTitle.Text = "Dungeon Map | Dang cho map"
+        DungeonFarm.mapSummary.Text = "Chua co du lieu room."
+        DungeonFarm.mapLegend.Text = "P = vi tri hien tai | G = tat ca room vang"
+        return
+    end
+
+    local _, nativeCells = DungeonFarm.getNativeMapCells()
+    local canvasWidth = canvas.AbsoluteSize.X > 0 and canvas.AbsoluteSize.X or 310
+    local canvasHeight = canvas.AbsoluteSize.Y > 0 and canvas.AbsoluteSize.Y or 260
+    local gridSize = 17
+    local cellSize = math.max(8, math.floor(math.min(canvasWidth, canvasHeight) / gridSize))
+    local mapSize = cellSize * gridSize
+    local mapOffsetX = math.max(0, math.floor((canvasWidth - mapSize) / 2))
+    local mapOffsetY = math.max(0, math.floor((canvasHeight - mapSize) / 2))
+    local routeByKey = {}
+    for index, entry in ipairs(DungeonFarm.route) do
+        routeByKey[entry.key] = index
+    end
+    local goldByKey = {}
+    for _, entry in ipairs(DungeonFarm.goldRooms) do
+        goldByKey[entry.key] = true
+    end
+
+    local function cellPosition(entry)
+        -- Native DungeonMinimap uses x increasing right and y increasing down.
+        local x = mapOffsetX + (entry.x - 1) * cellSize
+        local y = mapOffsetY + (entry.y - 1) * cellSize
+        return x, y
+    end
+
+    for index = 1, #DungeonFarm.route - 1 do
+        local first = DungeonFarm.route[index]
+        local second = DungeonFarm.route[index + 1]
+        local x1, y1 = cellPosition(first)
+        local x2, y2 = cellPosition(second)
+        local line = Instance.new("Frame")
+        line.BorderSizePixel = 0
+        line.BackgroundColor3 = Color3.fromRGB(65, 205, 224)
+        line.BackgroundTransparency = 0.1
+        line.ZIndex = 1
+        if x1 == x2 then
+            line.Position = UDim2.fromOffset(x1 + cellSize / 2 - 2, math.min(y1, y2) + cellSize / 2)
+            line.Size = UDim2.fromOffset(4, math.abs(y2 - y1) + 2)
+        else
+            line.Position = UDim2.fromOffset(math.min(x1, x2) + cellSize / 2, y1 + cellSize / 2 - 2)
+            line.Size = UDim2.fromOffset(math.abs(x2 - x1) + 2, 4)
+        end
+        line.Parent = canvas
+    end
+
+    for _, entry in ipairs(rooms) do
+        local x, y = cellPosition(entry)
+        local cell = Instance.new("Frame")
+        cell.Name = "Room_" .. tostring(entry.x) .. "_" .. tostring(entry.y)
+        cell.Position = UDim2.fromOffset(x, y)
+        cell.Size = UDim2.fromOffset(cellSize, cellSize)
+        cell.BorderSizePixel = 0
+        cell.ZIndex = 2
+
+        local revealed = entry.room:FindFirstChild("ConfirmPart") ~= nil
+        local routeIndex = routeByKey[entry.key]
+        local isGoldRoom = goldByKey[entry.key] == true
+        local nativeCell = nativeCells[tostring(entry.x) .. ":" .. tostring(entry.y)]
+        if nativeCell then
+            cell.BackgroundColor3 = nativeCell.BackgroundColor3
+            cell.BackgroundTransparency = nativeCell.BackgroundTransparency
+            cell.BorderColor3 = nativeCell.BorderColor3
+            cell.BorderSizePixel = nativeCell.BorderSizePixel
+        elseif isGoldRoom then
+            cell.BackgroundColor3 = Color3.fromRGB(246, 190, 52)
+        elseif entry == startEntry then
+            cell.BackgroundColor3 = Color3.fromRGB(83, 220, 122)
+        elseif routeIndex then
+            cell.BackgroundColor3 = Color3.fromRGB(40, 150, 177)
+        elseif revealed then
+            cell.BackgroundColor3 = Color3.fromRGB(90, 100, 116)
+        else
+            cell.BackgroundColor3 = Color3.fromRGB(42, 47, 58)
+        end
+        cell.Parent = canvas
+
+        if nativeCell then
+            for _, nativeDoor in ipairs(nativeCell:GetChildren()) do
+                if nativeDoor:IsA("GuiObject") and nativeDoor.Name:match("^Door[1-4]$") then
+                    local door = nativeDoor:Clone()
+                    door.Visible = true
+                    door.ZIndex = 3
+                    door.Parent = cell
+                end
+            end
+        end
+
+        if isGoldRoom or entry == startEntry then
+            local marker = Instance.new("TextLabel")
+            marker.BackgroundTransparency = 1
+            marker.Size = UDim2.fromScale(1, 1)
+            marker.Font = Enum.Font.GothamBold
+            marker.TextSize = math.max(8, math.min(14, cellSize - 4))
+            marker.TextColor3 = Color3.fromRGB(20, 25, 30)
+            marker.Text = isGoldRoom and "G" or "P"
+            marker.ZIndex = 4
+            marker.Parent = cell
+        end
+    end
+
+    local startText = startEntry and (tostring(startEntry.x) .. "," .. tostring(startEntry.y)) or "?"
+    local goldText = goldEntry and (tostring(goldEntry.x) .. "," .. tostring(goldEntry.y)) or "?"
+    local routeText = #DungeonFarm.route > 0 and tostring(#DungeonFarm.route) .. " room" or "chua tim thay"
+    DungeonFarm.mapTitle.Text = "Dungeon Map | Room vang (native)"
+    DungeonFarm.mapSummary.Text = string.format(
+        "P %s -> G %s | Gold: %d | Route: %s | Da doc %d room",
+        startText,
+        goldText,
+        #DungeonFarm.goldRooms,
+        routeText,
+        #rooms
+    )
+    DungeonFarm.mapLegend.Text = "P = vi tri hien tai | G = tat ca room vang | Mau = map game | Xanh = duong toi room vang"
+end
+
+function DungeonFarm.updateMapOverlay()
+    local gui = DungeonFarm.ensureMapOverlay()
+    if not gui then
+        return
+    end
+    local dungeon = DungeonFarm.getDungeon()
+    if not dungeon then
+        gui.Enabled = false
+        return
+    end
+    DungeonFarm.renderMapOverlay(dungeon)
+end
+
 function DungeonFarm.getDoorInfo(prompt, map)
     if not (prompt and map) then
         return nil
@@ -3226,21 +4142,66 @@ function DungeonFarm.getDoorInfo(prompt, map)
     }
 end
 
+function DungeonFarm.doorLeadsToGoldTarget(door, room, dungeon)
+    local target = DungeonFarm.routeTarget
+    if not (door and room and target and target.Parent) then
+        return false
+    end
+    if room == target then
+        return true
+    end
+
+    -- Prefer the already-built shortest route, then verify the physical direction.
+    for index, entry in ipairs(DungeonFarm.route) do
+        if entry.room == room then
+            local nextEntry = DungeonFarm.route[index + 1]
+            if nextEntry and nextEntry.room == target then
+                return true
+            end
+        end
+    end
+
+    local sourceX, sourceY = DungeonFarm.getMapCoordinate(room)
+    local targetX, targetY = DungeonFarm.getMapCoordinate(target)
+    local center = DungeonFarm.getRoomCenter(room)
+    if not (sourceX and sourceY and targetX and targetY and center) then
+        return false
+    end
+    local delta = door.Position - center
+    local nextX, nextY
+    if math.abs(delta.X) >= math.abs(delta.Z) then
+        nextX = sourceX + (delta.X >= 0 and 1 or -1)
+        nextY = sourceY
+    else
+        nextX = sourceX
+        nextY = sourceY + (delta.Z >= 0 and 1 or -1)
+    end
+    return nextX == targetX and nextY == targetY
+end
+
 function DungeonFarm.findGoldDoor(dungeon)
     local map = dungeon and dungeon:FindFirstChild("Map")
     if not map then
         return nil
     end
 
+    local fallback
     for _, object in ipairs(map:GetDescendants()) do
         if object:IsA("ProximityPrompt") and object.Enabled then
             local info = DungeonFarm.getDoorInfo(object, map)
             if info and info.roomKey
                 and DungeonFarm.completed[info.roomKey]
                 and not DungeonFarm.goldDoorsOpened[info.key] then
-                return object, info.door, info.room, info.key, info.roomKey
+                if not DungeonFarm.goldTargetKey
+                    or DungeonFarm.doorLeadsToGoldTarget(info.door, info.room, dungeon) then
+                    return object, info.door, info.room, info.key, info.roomKey
+                end
+                fallback = fallback or {object, info.door, info.room, info.key, info.roomKey}
             end
         end
+    end
+    if not DungeonFarm.goldTargetKey and fallback then
+        return table.unpack(fallback)
     end
     return nil
 end
@@ -3302,6 +4263,20 @@ function DungeonFarm.getChestTargets(dungeon)
         end
     end
     return targets
+end
+
+function DungeonFarm.isGoldRunComplete(dungeon)
+    local target = DungeonFarm.routeTarget
+    if not (target and target.Parent and DungeonFarm.goldTargetKey) then
+        return false
+    end
+    if not DungeonFarm.completed[target:GetFullName()] then
+        return false
+    end
+    if DungeonFarm.findGoldDoor(dungeon) then
+        return false
+    end
+    return #DungeonFarm.getChestTargets(dungeon) == 0
 end
 
 function DungeonFarm.enemyCount(dungeon)
@@ -3446,8 +4421,11 @@ function DungeonFarm.flyTo(targetPart, token)
     return reached
 end
 
-function DungeonFarm.isLiveEnemy(enemy, enemies)
+function DungeonFarm.isLiveEnemy(enemy, enemies, forceProbe)
     if not (enemy and enemy.Parent == enemies and enemy:IsA("Model")) then
+        return false, false
+    end
+    if DungeonFarm.deadEnemies[enemy] then
         return false, false
     end
 
@@ -3468,15 +4446,12 @@ function DungeonFarm.isLiveEnemy(enemy, enemies)
     if health ~= nil and health <= 0 then
         return false, false
     end
-    if attackable then
-        return true, false
-    end
-
     -- A dead model can keep a stale positive Health value after Attackable is removed.
-    -- Ask the game's local-health endpoint first, then age out an unresolved model.
+    -- Ask the game's local-health endpoint before trusting a stale Attackable tag.
     if GetLocalEnemyHealth then
         local lastProbe = DungeonFarm.enemyHealthProbeAt[enemy] or 0
-        if now - lastProbe >= 1 then
+        local probeInterval = forceProbe and 0.25 or 1
+        if now - lastProbe >= probeInterval then
             DungeonFarm.enemyHealthProbeAt[enemy] = now
             local ok, serverHealth = pcall(function()
                 return GetLocalEnemyHealth:InvokeServer(enemy)
@@ -3490,6 +4465,10 @@ function DungeonFarm.isLiveEnemy(enemy, enemies)
                 return serverHealth > 0, false
             end
         end
+    end
+
+    if attackable then
+        return true, false
     end
 
     if now - DungeonFarm.enemySeenAt[enemy] < 3 then
@@ -3574,7 +4553,8 @@ function DungeonFarm.clearEnemies(dungeon, token)
         end
 
         local lastSend = 0
-        while DungeonFarm.isLiveEnemy(enemy, enemies) do
+        local targetLive, targetUnknown = DungeonFarm.isLiveEnemy(enemy, enemies, true)
+        while targetLive or targetUnknown do
             if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
                 return false, "Da dung dungeon farm."
             end
@@ -3594,6 +4574,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
                 lastSend = os.clock()
             end
 
+            targetLive, targetUnknown = DungeonFarm.isLiveEnemy(enemy, enemies, true)
             local remaining = #DungeonFarm.getLiveEnemies(dungeon)
             DungeonFarm.lastEnemyCount = remaining
             DungeonFarm.updateStatus(
@@ -3608,17 +4589,25 @@ function DungeonFarm.clearEnemies(dungeon, token)
             task.wait(0.25)
         end
 
-        DungeonFarm.lastEnemyCount = #DungeonFarm.getLiveEnemies(dungeon)
+        if not targetUnknown then
+            -- Exclude the dead model immediately so the next pass picks a fresh target.
+            DungeonFarm.deadEnemies[enemy] = true
+        end
+        local refreshedEnemies, refreshedUncertain = DungeonFarm.getLiveEnemies(dungeon)
+        DungeonFarm.lastEnemyCount = #refreshedEnemies
         DungeonFarm.updateStatus(
             "Dungeon Farm: COMBAT",
             string.format(
-                "Room %s | Da ha %s | Con %d enemy",
+                "Room %s | Da ha %s | Chuyen muc tieu | Con %d enemy",
                 tostring(DungeonFarm.room or "?"),
                 tostring(enemy.Name),
                 DungeonFarm.lastEnemyCount
             )
         )
-        task.wait(0.15)
+        if #refreshedEnemies == 0 and not refreshedUncertain then
+            return true, "Da clear enemy."
+        end
+        task.wait(0.05)
     end
 
     if not enemies.Parent then
@@ -3703,6 +4692,11 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
         if not prompt.Parent or not prompt.Enabled then
             DungeonFarm.goldDoorsOpened[key] = true
             DungeonFarm.goldRoomsOpened[room:GetFullName()] = true
+            DungeonFarm.goldContentActive = true
+            if DungeonFarm.routeTarget and DungeonFarm.doorLeadsToGoldTarget(door, room, DungeonFarm.getDungeon()) then
+                DungeonFarm.targetRoom = DungeonFarm.routeTarget
+                DungeonFarm.room = DungeonFarm.routeTarget.Name
+            end
             return true, "Da mo cua vang."
         end
         if os.clock() >= deadline then
@@ -3759,11 +4753,20 @@ function DungeonFarm.start()
     DungeonFarm.lastEnemyCount = 0
     DungeonFarm.completed = {}
     DungeonFarm.attempts = {}
+    DungeonFarm.goldRooms = {}
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
     DungeonFarm.enemyHealthProbeAt = {}
     DungeonFarm.enemySeenAt = {}
+    DungeonFarm.deadEnemies = {}
+    DungeonFarm.route = {}
+    DungeonFarm.routeKey = ""
+    DungeonFarm.routeTarget = nil
+    DungeonFarm.goldTargetKey = nil
+    DungeonFarm.goldTargetRoom = nil
+    DungeonFarm.goldRoomKeys = {}
+    DungeonFarm.goldContentActive = false
     DungeonFarm.startedAt = os.clock()
     DungeonFarm.lastMessage = "Dang tim ConfirmPart active."
 
@@ -3782,9 +4785,19 @@ function DungeonFarm.start()
                 DungeonFarm.updateStatus("Dungeon Farm: CHO", "Dang cho map Dungeon load...")
                 task.wait(0.5)
             else
+                DungeonFarm.rebuildRoute(dungeon)
                 local enemies = dungeon:FindFirstChild("Enemies")
                 local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
                 if #liveEnemies > 0 or uncertainEnemies then
+                    local combatRoom = DungeonFarm.targetRoom
+                    if not combatRoom then
+                        local _, currentEntry = DungeonFarm.rebuildRoute(dungeon)
+                        combatRoom = currentEntry and currentEntry.room or nil
+                    end
+                    if not DungeonFarm.ensureRoomTeam(combatRoom) then
+                        DungeonFarm.fail("Khong doi duoc team cho room dang combat.", token)
+                        return
+                    end
                     DungeonFarm.phase = "combat"
                     local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
                     if not ok then
@@ -3794,6 +4807,19 @@ function DungeonFarm.start()
                 else
                     local chests = DungeonFarm.getChestTargets(dungeon)
                     if #chests > 0 then
+                        local map = dungeon:FindFirstChild("Map")
+                        local chestRoom = map and DungeonFarm.findRoom(chests[1], map) or nil
+                        local chestTeamIndex, chestRole = DungeonFarm.getRoomTeamIndex(chestRoom)
+                        if DungeonFarm.goldContentActive then
+                            chestTeamIndex = tonumber(dungeonSelection.goldTeamIndex)
+                                or tonumber(dungeonSelection.normalTeamIndex)
+                                or 1
+                            chestRole = "gold"
+                        end
+                        if not DungeonFarm.ensureTeamApplied(chestTeamIndex, chestRole) then
+                            DungeonFarm.fail("Khong doi duoc team cho room chest.", token)
+                            return
+                        end
                         DungeonFarm.phase = "chest"
                         local ok, reason = DungeonFarm.clearChests(dungeon, token)
                         if not ok then
@@ -3801,8 +4827,20 @@ function DungeonFarm.start()
                             return
                         end
                     else
+                        if DungeonFarm.isGoldRunComplete(dungeon) then
+                            local left, reason = DungeonFarm.leaveAfterGold(token)
+                            if not left then
+                                DungeonFarm.fail(reason, token)
+                            end
+                            return
+                        end
+
                         local doorPrompt, doorPart, doorRoom = DungeonFarm.findGoldDoor(dungeon)
                         if doorPrompt then
+                            if not DungeonFarm.ensureRoomTeam(doorRoom) then
+                                DungeonFarm.fail("Khong doi duoc team cho room mo cua vang.", token)
+                                return
+                            end
                             local ok, reason = DungeonFarm.openGoldDoor(doorPrompt, doorPart, doorRoom, token)
                             if not ok then
                                 DungeonFarm.fail(reason, token)
@@ -3846,6 +4884,10 @@ function DungeonFarm.start()
                                 DungeonFarm.targetRoom = room
                                 DungeonFarm.targetPart = part
                                 DungeonFarm.room = room.Name
+                                if not DungeonFarm.ensureRoomTeam(room) then
+                                    DungeonFarm.fail("Khong doi duoc team cho room " .. tostring(room.Name) .. ".", token)
+                                    return
+                                end
                                 local attempts = (DungeonFarm.attempts[key] or 0) + 1
                                 DungeonFarm.attempts[key] = attempts
                                 if attempts > 3 then
@@ -3975,13 +5017,23 @@ local function restoreDungeonSession(reason)
     DungeonFarm.lastEnemyCount = 0
     DungeonFarm.completed = {}
     DungeonFarm.attempts = {}
+    DungeonFarm.goldRooms = {}
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
     DungeonFarm.enemyHealthProbeAt = {}
     DungeonFarm.enemySeenAt = {}
+    DungeonFarm.deadEnemies = {}
+    DungeonFarm.route = {}
+    DungeonFarm.routeKey = ""
+    DungeonFarm.routeTarget = nil
+    DungeonFarm.goldTargetKey = nil
+    DungeonFarm.goldTargetRoom = nil
+    DungeonFarm.goldRoomKeys = {}
+    DungeonFarm.goldContentActive = false
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
+    DungeonFarm.teamIndexApplied = nil
     DungeonFarm.lastMessage = reason or "Da khoi phuc cau hinh"
     DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", DungeonFarm.lastMessage)
     dungeonWaiting = false
@@ -4043,7 +5095,44 @@ end
 
 DungeonFarm.restore = restoreDungeonSession
 
+function DungeonFarm.leaveAfterGold(token)
+    if token and token ~= DungeonFarm.token then
+        return false, "Dungeon farm token da thay doi."
+    end
+    DungeonFarm.phase = "leaving"
+    DungeonFarm.updateStatus("Dungeon Farm: OUT", "Da clear room vang; dang roi Dungeon...")
+
+    local ok, reason = protectedCall("Leave dungeon after gold room", function()
+        local travelEvent = Bindable:FindFirstChild("AttemptTravel")
+        if not travelEvent then
+            error("Bindable.AttemptTravel khong ton tai")
+        end
+        travelEvent:Fire("Tower")
+    end)
+    if not ok then
+        return false, tostring(reason)
+    end
+
+    local deadline = os.clock() + 20
+    while alive() and token == DungeonFarm.token and os.clock() < deadline do
+        if tostring(getPlayerValue("World", "")) ~= "Dungeon" then
+            if dungeonSession and not dungeonSession.restoring then
+                task.delay(0.75, function()
+                    if alive() and dungeonSession and not dungeonSession.restoring then
+                        restoreDungeonSession("Da farm xong room vang")
+                    end
+                end)
+            end
+            DungeonFarm.running = false
+            return true
+        end
+        task.wait(0.25)
+    end
+    return false, "Khong roi duoc Dungeon sau khi clear room vang."
+end
+
 local function startAutoDungeon()
+    dungeonSelection.mapId = normalizeDungeonMapId(dungeonSelection.mapId) or "DBZ"
     if tostring(getPlayerValue("World", "")) == "Dungeon" then
         dungeonActive = true
         if not DungeonFarm.ensureTeamApplied() then
@@ -4154,11 +5243,21 @@ local function startAutoDungeon()
     DungeonFarm.lastEnemyCount = 0
     DungeonFarm.completed = {}
     DungeonFarm.attempts = {}
+    DungeonFarm.goldRooms = {}
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
+    DungeonFarm.deadEnemies = {}
+    DungeonFarm.route = {}
+    DungeonFarm.routeKey = ""
+    DungeonFarm.routeTarget = nil
+    DungeonFarm.goldTargetKey = nil
+    DungeonFarm.goldTargetRoom = nil
+    DungeonFarm.goldRoomKeys = {}
+    DungeonFarm.goldContentActive = false
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
+    DungeonFarm.teamIndexApplied = nil
     DungeonFarm.startedAt = os.clock()
     DungeonFarm.lastMessage = "Dang tao dungeon..."
     DungeonFarm.updateStatus("Dungeon Farm: START", DungeonFarm.lastMessage)
@@ -4282,6 +5381,36 @@ local function startAutoDungeon()
     end)
 end
 
+-- Keep a small runtime probe available while validating dungeon flows after a client rejoin.
+globalEnv.__auto_clone_debug = globalEnv.__auto_clone_debug or {}
+globalEnv.__auto_clone_debug.setDungeon = function(mapId, mode, size, teamIndex)
+    dungeonSelection.mapId = normalizeDungeonMapId(mapId) or dungeonSelection.mapId
+    dungeonSelection.mode = mode == "Friends" and "Friends" or "Public"
+    dungeonSelection.size = math.clamp(tonumber(size) or dungeonSelection.size, 0, 4)
+    dungeonSelection.normalTeamIndex = math.max(
+        1,
+        math.floor(tonumber(teamIndex) or dungeonSelection.normalTeamIndex or dungeonSelection.teamIndex)
+    )
+    dungeonSelection.teamIndex = dungeonSelection.normalTeamIndex
+    Feature.autoDungeonEnabled = true
+    return startAutoDungeon()
+end
+globalEnv.__auto_clone_debug.state = function()
+    return {
+        mapId = dungeonSelection.mapId,
+        mode = dungeonSelection.mode,
+        size = dungeonSelection.size,
+        teamIndex = dungeonSelection.teamIndex,
+        normalTeamIndex = dungeonSelection.normalTeamIndex,
+        goldTeamIndex = dungeonSelection.goldTeamIndex,
+        world = tostring(getPlayerValue("World", "")),
+        dungeonActive = dungeonActive,
+        dungeonWaiting = dungeonWaiting,
+        phase = DungeonFarm.phase,
+        message = DungeonFarm.lastMessage
+    }
+end
+
 dungeonFinishConnection = DungeonFinish.OnClientEvent:Connect(function()
     if alive() and dungeonActive then
         task.delay(1, function()
@@ -4297,6 +5426,13 @@ dungeonFinishConnection = DungeonFinish.OnClientEvent:Connect(function()
                     dungeonActive = false
                     DungeonFarm.teamApplied = false
                     DungeonFarm.teamApplying = false
+                    DungeonFarm.teamIndexApplied = nil
+                    DungeonFarm.route = {}
+                    DungeonFarm.routeKey = ""
+                    DungeonFarm.routeTarget = nil
+                    DungeonFarm.goldTargetKey = nil
+                    DungeonFarm.goldTargetRoom = nil
+                    DungeonFarm.goldRoomKeys = {}
                     DungeonFarm.phase = "idle"
                     DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Dungeon da hoan tat.")
                 end
@@ -4341,6 +5477,13 @@ if worldValue then
                         dungeonActive = false
                         DungeonFarm.teamApplied = false
                         DungeonFarm.teamApplying = false
+                        DungeonFarm.teamIndexApplied = nil
+                        DungeonFarm.route = {}
+                        DungeonFarm.routeKey = ""
+                        DungeonFarm.routeTarget = nil
+                        DungeonFarm.goldTargetKey = nil
+                        DungeonFarm.goldTargetRoom = nil
+                        DungeonFarm.goldRoomKeys = {}
                         DungeonFarm.phase = "idle"
                         DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Da roi khoi dungeon.")
                     end
@@ -4382,17 +5525,36 @@ local function buildDungeonControls()
 
     local teams = makeDungeonTeamOptions()
     local teamCount = #getStoreTable("PetTeams", true)
-    if not configLoaded
-        or type(dungeonSelection.teamIndex) ~= "number"
-        or dungeonSelection.teamIndex < 1
-        or dungeonSelection.teamIndex > teamCount then
-        dungeonSelection.teamIndex = getDungeonDefaultTeam()
+    local defaultTeamIndex = getDungeonDefaultTeam()
+    local normalTeamIndex = tonumber(dungeonSelection.normalTeamIndex)
+        or tonumber(dungeonSelection.teamIndex)
+        or defaultTeamIndex
+    if teamCount > 0 then
+        if not configLoaded then
+            normalTeamIndex = defaultTeamIndex
+        end
+        normalTeamIndex = math.clamp(math.floor(normalTeamIndex), 1, teamCount)
+    else
+        normalTeamIndex = 1
     end
-    local defaultTeam
+    local goldTeamIndex = tonumber(dungeonSelection.goldTeamIndex) or normalTeamIndex
+    if teamCount > 0 then
+        goldTeamIndex = math.clamp(math.floor(goldTeamIndex), 1, teamCount)
+    else
+        goldTeamIndex = 1
+    end
+    dungeonSelection.normalTeamIndex = normalTeamIndex
+    dungeonSelection.goldTeamIndex = goldTeamIndex
+    dungeonSelection.teamIndex = normalTeamIndex
+
+    local defaultNormalTeam
+    local defaultGoldTeam
     for option, index in pairs(dungeonTeamByOption) do
-        if index == dungeonSelection.teamIndex then
-            defaultTeam = option
-            break
+        if index == normalTeamIndex then
+            defaultNormalTeam = option
+        end
+        if index == goldTeamIndex then
+            defaultGoldTeam = option
         end
     end
 
@@ -4403,7 +5565,7 @@ local function buildDungeonControls()
     end
     DungeonTab:Paragraph({
         Title = "Auto Dungeon",
-        Desc = "Chon map, mode, kich thuoc va team. Artifact Passage luon duoc dung de mo dungeon; sau khi vao map moi doi sang team da chon."
+        Desc = "Chon map, mode, kich thuoc, team room thuong va team room vang. Artifact Passage luon duoc dung de mo dungeon; vao map se dung team room thuong."
     })
     dungeonCooldownParagraph = DungeonTab:Button({
         Title = "Cooldown dungeon",
@@ -4439,14 +5601,26 @@ local function buildDungeonControls()
             saveConfig(true)
         end
     })
-    dungeonTeamDropdown = DungeonTab:Dropdown({
-        Title = utf8Text("Doi hinh", 272, 7897, 105, 32, 104, 236, 110, 104),
+    dungeonNormalTeamDropdown = DungeonTab:Dropdown({
+        Title = "Team room thuong",
         Values = teams,
-        Value = defaultTeam,
+        Value = defaultNormalTeam,
         SearchBarEnabled = true,
         MenuWidth = 300,
         Callback = function(value)
-            dungeonSelection.teamIndex = dungeonTeamByOption[value] or dungeonSelection.teamIndex
+            dungeonSelection.normalTeamIndex = dungeonTeamByOption[value] or dungeonSelection.normalTeamIndex
+            dungeonSelection.teamIndex = dungeonSelection.normalTeamIndex
+            saveConfig(true)
+        end
+    })
+    dungeonGoldTeamDropdown = DungeonTab:Dropdown({
+        Title = "Team room vang",
+        Values = teams,
+        Value = defaultGoldTeam,
+        SearchBarEnabled = true,
+        MenuWidth = 300,
+        Callback = function(value)
+            dungeonSelection.goldTeamIndex = dungeonTeamByOption[value] or dungeonSelection.goldTeamIndex
             saveConfig(true)
         end
     })
@@ -4722,6 +5896,37 @@ function AutoPassive.buildAutoPassiveControls()
     })
 end
 
+Feature.mainStatusParagraph = MainTab:Button({
+    Title = "Main | dang khoi tao",
+    Desc = "Trang thai Auto collect drop.",
+    Callback = function() end
+})
+
+Feature.autoCollectDropsToggle = MainTab:Toggle({
+    Title = "Auto collect drop",
+    Desc = "Dua drop trong workspace.Effects ve player khong gioi han khoang cach.",
+    Value = false,
+    Callback = function(value)
+        if Feature.autoCollectDropsToggleUpdating or Feature.restoringFeatureState then
+            return
+        end
+        Feature.autoCollectDropsEnabled = value == true
+        if not Feature.autoCollectDropsEnabled then
+            Feature.mainSeenDrops = setmetatable({}, {__mode = "k"})
+        end
+        Feature.updateMainStatus(true)
+        saveConfig(true)
+    end
+})
+
+MainTab:Button({
+    Title = "Mo GUI Dupe Machine",
+    Desc = "Mo cua so Dupe Machine bang luong GUI cua game.",
+    Callback = function()
+        protectedCall("Open dupe machine GUI", openDupeMachineGui)
+    end
+})
+
 statusParagraph = StatusTab:Button({
     Title = "Trang thai may",
     Desc = "Trang thai A/B/K/M cap nhat lien tuc trong tab nay.",
@@ -4971,7 +6176,16 @@ end
 syncDungeonControls = function()
     beginDropdownSync()
     selectMapped(dungeonMapDropdown, dungeonMapByOption, dungeonSelection.mapId)
-    selectMapped(dungeonTeamDropdown, dungeonTeamByOption, dungeonSelection.teamIndex)
+    selectMapped(
+        dungeonNormalTeamDropdown,
+        dungeonTeamByOption,
+        dungeonSelection.normalTeamIndex or dungeonSelection.teamIndex
+    )
+    selectMapped(
+        dungeonGoldTeamDropdown,
+        dungeonTeamByOption,
+        dungeonSelection.goldTeamIndex or dungeonSelection.normalTeamIndex or dungeonSelection.teamIndex
+    )
     selectMapped(dungeonSecondArtifactDropdown, dungeonArtifactByOption, dungeonSelection.secondArtifact)
     local sizeNames = {[0] = "Small", [1] = "Medium", [2] = "Large", [3] = "Insane", [4] = "Hellish"}
     pcall(function()
@@ -5038,6 +6252,7 @@ Feature.applySavedState = function()
     Feature.autoPassiveRunToken = Feature.autoPassiveRunToken + 1
     Feature.autoFarmTarget = nil
     Feature.autoFarmLastSend = 0
+    Feature.mainSeenDrops = setmetatable({}, {__mode = "k"})
     setToggleSilently(Feature.autoCloneToggle, false, function(value)
         Feature.autoCloneToggleUpdating = value
     end)
@@ -5050,6 +6265,10 @@ Feature.applySavedState = function()
     setToggleSilently(Feature.autoPassiveToggle, false, function(value)
         Feature.autoPassiveToggleUpdating = value
     end)
+    setToggleSilently(Feature.autoCollectDropsToggle, false, function(value)
+        Feature.autoCollectDropsToggleUpdating = value
+    end)
+    Feature.autoCollectDropsEnabled = false
     Feature.restoringFeatureState = false
 
     if desired.autoClone and selectedCount() > 0 then
@@ -5089,6 +6308,13 @@ Feature.applySavedState = function()
             protectedCall("Start saved auto passive", AutoPassive.startAutoPassive)
         end)
     end
+    if desired.autoCollectDrops then
+        Feature.autoCollectDropsEnabled = true
+        setToggleSilently(Feature.autoCollectDropsToggle, true, function(value)
+            Feature.autoCollectDropsToggleUpdating = value
+        end)
+    end
+    Feature.updateMainStatus(true)
     Feature.updateAutoPassiveStatus()
 end
 
@@ -5148,8 +6374,18 @@ local function finishSetup(loadOldConfig)
                 updateMachineStatus()
                 Feature.updateStatus()
                 updateDungeonCooldownStatus()
+                DungeonFarm.updateMapOverlay()
             end)
             task.wait(1)
+        end
+    end)
+
+    task.spawn(function()
+        while alive() do
+            protectedCall("Main feature loop", function()
+                Feature.mainStep()
+            end)
+            task.wait(0.1)
         end
     end)
 
