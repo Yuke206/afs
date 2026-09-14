@@ -141,7 +141,6 @@ local AttemptTravel = Remote:WaitForChild("AttemptTravel")
 local SummonDungeon = Remote:WaitForChild("SummonDungeon")
 local SetDungeonSetting = Remote:WaitForChild("SetDungeonSetting")
 local ManagePet = Remote:WaitForChild("ManagePet")
-local GetLocalEnemyHealth = Remote:FindFirstChild("GetLocalEnemyHealth")
 local ChangeTitle = Remote:WaitForChild("ChangeTitle")
 local AttemptAvatarEquip = Remote:WaitForChild("AttemptAvatarEquip")
 local EquipAura = Remote:WaitForChild("EquipAura")
@@ -309,6 +308,14 @@ local Feature = {
     autoCollectDropsEnabled = false,
     autoCollectDropsToggle = nil,
     autoCollectDropsToggleUpdating = false,
+    tpPetEnabled = false,
+    tpPetToggle = nil,
+    tpPetToggleUpdating = false,
+    attackWhileUltEnabled = false,
+    attackWhileUltToggle = nil,
+    attackWhileUltToggleUpdating = false,
+    attackWhileUltLastFire = setmetatable({}, {__mode = "k"}),
+    attackWhileUltLastScan = 0,
     mainStatusParagraph = nil,
     mainStatusLastUpdate = 0,
     mainSeenDrops = setmetatable({}, {__mode = "k"}),
@@ -427,8 +434,14 @@ local DungeonFarm = {
     goldDoorsOpened = {},
     goldRoomsOpened = {},
     completedChests = {},
-    enemyHealthProbeAt = {},
     enemySeenAt = {},
+    lastCombatTarget = nil,
+    lastCombatSendAt = 0,
+    combatSendCount = 0,
+    lastCombatError = "",
+    lastLiveScanAt = 0,
+    lastLiveScanCount = 0,
+    lastLiveScanUncertain = false,
     route = {},
     routeKey = "",
     routeTarget = nil,
@@ -436,6 +449,7 @@ local DungeonFarm = {
     goldTargetRoom = nil,
     goldRoomKeys = {},
     goldContentActive = false,
+    goldRoomEmptySince = {},
     routeFolder = nil,
     mapGui = nil,
     mapPanel = nil,
@@ -446,6 +460,8 @@ local DungeonFarm = {
     teamApplied = false,
     teamApplying = false,
     teamIndexApplied = nil,
+    teamAppliedAt = 0,
+    lastEquippedPetCount = 0,
     deadEnemies = {},
     teleportDistance = 120,
     flySpeed = 140,
@@ -1114,7 +1130,9 @@ local function saveConfig(silent)
                 autoDungeonFarm = DungeonFarm.enabled,
                 autoFarm = Feature.autoFarmEnabled,
                 autoPassive = Feature.autoPassiveEnabled,
-                autoCollectDrops = Feature.autoCollectDropsEnabled
+                autoCollectDrops = Feature.autoCollectDropsEnabled,
+                tpPet = Feature.tpPetEnabled,
+                attackWhileUlt = Feature.attackWhileUltEnabled
             },
             autoFarm = {
                 mode = Feature.autoFarmMode
@@ -1173,7 +1191,9 @@ local function loadConfig()
             autoDungeonFarm = data.features.autoDungeonFarm ~= false,
             autoFarm = data.features.autoFarm == true,
             autoPassive = data.features.autoPassive == true,
-            autoCollectDrops = data.features.autoCollectDrops == true
+            autoCollectDrops = data.features.autoCollectDrops == true,
+            tpPet = data.features.tpPet == true,
+            attackWhileUlt = data.features.attackWhileUlt == true
         }
     end
     if type(data.autoFarm) == "table" then
@@ -2803,6 +2823,166 @@ function Feature.collectDropsStep()
     end
 end
 
+function Feature.applyTpPet()
+    -- Spoof the Lightspeed (SummerTime) passive effect "Teleport" so pets use
+    -- the game's own instant-teleport path (LocalPetHandler teleports pets
+    -- straight to targets farther than 30 studs instead of walking over).
+    -- The handler reads the effect once when each pet spawns, so the toggle
+    -- applies to pets sent out after enabling (swap team / enter dungeon to
+    -- respawn pets already out).
+    local module = nil
+    local ok = pcall(function()
+        local folder = ReplicatedStorage:WaitForChild("ModuleScripts")
+        module = folder:WaitForChild("HasPassive")
+        module = require(module)
+    end)
+    if not ok or type(module) ~= "table" then
+        return false
+    end
+    if Feature.tpPetEnabled then
+        if not module.__tpPetWrapped then
+            if type(module.GetEffect) ~= "function" then
+                return false
+            end
+            module.__tpPetOriginal = module.GetEffect
+            local original = module.GetEffect
+            module.GetEffect = function(pet, name, ...)
+                if name == "Teleport" then
+                    return true
+                end
+                return original(pet, name, ...)
+            end
+            module.__tpPetWrapped = true
+        end
+    elseif module.__tpPetWrapped then
+        -- Original is stored on the module itself so any reload generation
+        -- can unwrap cleanly even after its own locals were reset.
+        if type(module.__tpPetOriginal) == "function" then
+            module.GetEffect = module.__tpPetOriginal
+        end
+        module.__tpPetOriginal = nil
+        module.__tpPetWrapped = nil
+    end
+    return true
+end
+
+function Feature.getUltDmgModules()
+    if Feature.ultDmgModules then
+        return Feature.ultDmgModules
+    end
+    local ok, mods = pcall(function()
+        local moduleScripts = ReplicatedStorage:WaitForChild("ModuleScripts")
+        local handler = LocalPlayer:WaitForChild("PlayerScripts")
+            :WaitForChild("StarterPlayerScriptsFolder")
+            :WaitForChild("LocalPetHandler")
+        return {
+            StatCalc = require(moduleScripts:WaitForChild("StatCalc")),
+            EnemyStats = require(moduleScripts:WaitForChild("EnemyStats")),
+            HasPassive = require(moduleScripts:WaitForChild("HasPassive")),
+            EnemyDamagedEffect = require(handler:WaitForChild("EnemyDamagedEffect")),
+        }
+    end)
+    if ok and type(mods) == "table" then
+        Feature.ultDmgModules = mods
+        return mods
+    end
+    return nil
+end
+
+function Feature.showUltSupplementDamage(pet, enemy)
+    -- Supplement hits are server-only, so mirror the game's own client visual
+    -- (pet_attack): same damage formula, same delayed damage number + sound.
+    if not (pet and pet.Parent and enemy and enemy.Parent) then
+        return
+    end
+    local mods = Feature.getUltDmgModules()
+    if not mods then
+        return
+    end
+    local ok, damage = pcall(function()
+        local fake = mods.StatCalc.GetFakeDataFromModel(pet)
+        local petsData = getStoreTable("Pets", true)
+        local world = tostring(getPlayerValue("World", ""))
+        local amount = mods.StatCalc.GetStat("Attack", fake, world, LocalPlayer, petsData)
+            * GetMultiplier.Dmg(LocalPlayer)
+        local stats = mods.EnemyStats[enemy.Name]
+        if stats and (stats.Boss or stats.RaidBoss) then
+            local mult = mods.HasPassive.GetEffect(pet, "BossDamage")
+            if mult ~= nil then
+                amount = amount * mult
+            end
+        end
+        return amount
+    end)
+    if not ok or tonumber(damage) == nil then
+        return
+    end
+    task.delay(0.3, function()
+        pcall(function()
+            if pet.Parent and pet:FindFirstChild("Data") and pet.Data.Attacking.Value == enemy then
+                mods.EnemyDamagedEffect.DoEffect(enemy, damage)
+            end
+        end)
+    end)
+end
+
+function Feature.attackWhileUltStep()
+    -- The game pauses normal hits while a pet casts its ability (combat_tick
+    -- stretches AttackTime over the cast, ~4s after the 0.5s ult bar), so
+    -- AbilityCount stalls through ult + lockout. Send the server our own
+    -- PetAttack for ulting pets so normal damage and energy gain continue.
+    -- Live-verified: server accepts the extra hits and AbilityCount rises.
+    if not Feature.attackWhileUltEnabled then
+        return
+    end
+    local now = os.clock()
+    if now - Feature.attackWhileUltLastScan < 0.25 then
+        return
+    end
+    Feature.attackWhileUltLastScan = now
+    local petsFolder = workspace:FindFirstChild("Pets")
+    local remoteFolder = ReplicatedStorage:FindFirstChild("Remote")
+    local event = remoteFolder and remoteFolder:FindFirstChild("PetAttack")
+    if not petsFolder or not event then
+        return
+    end
+    for _, pet in ipairs(petsFolder:GetChildren()) do
+        if pet:IsA("Model") then
+            local data = pet:FindFirstChild("Data")
+            local owner = data and data:FindFirstChild("Owner")
+            local attacking = data and data:FindFirstChild("Attacking")
+            local target = attacking and attacking.Value
+            local useTime = data and data:FindFirstChild("AbilityUseTime")
+            local slot = Feature.attackWhileUltLastFire[pet]
+            if owner and owner.Value == LocalPlayer and target ~= nil and target.Parent ~= nil and useTime then
+                local ulting = tonumber(useTime.Value) and useTime.Value > 0
+                if ulting then
+                    -- Refresh the window while the ult bar is up; it also
+                    -- covers the few seconds of attack lockout after it.
+                    if type(slot) ~= "table" then
+                        slot = { t = 0 }
+                        Feature.attackWhileUltLastFire[pet] = slot
+                    end
+                    slot.untilTime = now + 4.5
+                end
+                if type(slot) == "table" and slot.untilTime and now < slot.untilTime then
+                    if now - (slot.t or 0) >= 1 then
+                        slot.t = now
+                        pcall(function()
+                            event:FireServer(pet)
+                        end)
+                        Feature.showUltSupplementDamage(pet, target)
+                    end
+                elseif slot then
+                    Feature.attackWhileUltLastFire[pet] = nil
+                end
+            elseif slot then
+                Feature.attackWhileUltLastFire[pet] = nil
+            end
+        end
+    end
+end
+
 function Feature.updateMainStatus(force)
     if not Feature.mainStatusParagraph then
         return
@@ -2812,15 +2992,25 @@ function Feature.updateMainStatus(force)
         return
     end
     Feature.mainStatusLastUpdate = now
+    pcall(function()
+        globalEnv.__afs_main = {
+            collect = Feature.autoCollectDropsEnabled,
+            tpPet = Feature.tpPetEnabled,
+            ultHit = Feature.attackWhileUltEnabled,
+        }
+    end)
     setParagraph(
         Feature.mainStatusParagraph,
-        "Main | Collect drop: " .. (Feature.autoCollectDropsEnabled and "BAT" or "TAT"),
-        "Auto collect drop khong gioi han khoang cach."
+        "Main | Collect drop: " .. (Feature.autoCollectDropsEnabled and "BAT" or "TAT")
+            .. " | TP Pet: " .. (Feature.tpPetEnabled and "BAT" or "TAT")
+            .. " | Ult Hit: " .. (Feature.attackWhileUltEnabled and "BAT" or "TAT"),
+        "Auto collect drop khong gioi han khoang cach. TP Pet gia lap Lightspeed."
     )
 end
 
 function Feature.mainStep()
     Feature.collectDropsStep()
+    Feature.attackWhileUltStep()
     Feature.updateMainStatus(false)
 end
 
@@ -2997,6 +3187,61 @@ local function copyEquippedPets()
     return result
 end
 
+local function findTeamIndexForEquipped(equipped)
+    equipped = type(equipped) == "table" and equipped or {}
+    local teams = getStoreTable("PetTeams", true)
+    local amount = 0
+    pcall(function()
+        amount = math.floor(tonumber(GetMultiplier.EquipAmount(LocalPlayer)) or 0)
+    end)
+    if amount < 1 then
+        for slot in pairs(equipped) do
+            amount = math.max(amount, tonumber(slot) or 0)
+        end
+        for _, team in ipairs(teams) do
+            local uids = type(team) == "table" and team.UIDs or {}
+            for slot in pairs(type(uids) == "table" and uids or {}) do
+                amount = math.max(amount, tonumber(slot) or 0)
+            end
+        end
+    end
+    if amount < 1 then
+        return nil
+    end
+
+    local function slotValue(data, slot)
+        return type(data) == "table" and (data[tostring(slot)] or data[slot]) or nil
+    end
+
+    local preferred = getDungeonDefaultTeam()
+    local fallback
+    for index, team in ipairs(teams) do
+        local uids = type(team) == "table" and team.UIDs or nil
+        if type(uids) == "table" then
+            local matches = true
+            local hasPet = false
+            for slot = 1, amount do
+                local actual = slotValue(equipped, slot)
+                local expected = slotValue(uids, slot)
+                if actual ~= nil or expected ~= nil then
+                    hasPet = hasPet or expected ~= nil or actual ~= nil
+                end
+                if tostring(actual or "") ~= tostring(expected or "") then
+                    matches = false
+                    break
+                end
+            end
+            if matches and hasPet then
+                if index == preferred then
+                    return index
+                end
+                fallback = fallback or index
+            end
+        end
+    end
+    return fallback
+end
+
 local function applyEquippedPets(desired)
     local amount = 0
     pcall(function()
@@ -3093,6 +3338,26 @@ function DungeonFarm.getEquipSlotCount()
     return math.max(0, math.floor(amount))
 end
 
+function DungeonFarm.getEquippedPetCount()
+    local equipped = getStoreTable("EquippedPets", true)
+    local count = 0
+    if type(equipped) ~= "table" then
+        DungeonFarm.lastEquippedPetCount = 0
+        return 0
+    end
+    for slot, uid in pairs(equipped) do
+        local slotNumber = tonumber(slot)
+        if slotNumber and slotNumber >= 1
+            and uid ~= nil
+            and uid ~= false
+            and tostring(uid) ~= "" then
+            count = count + 1
+        end
+    end
+    DungeonFarm.lastEquippedPetCount = count
+    return count
+end
+
 function DungeonFarm.normalizedUID(value)
     if value == nil or value == false or tostring(value) == "" then
         return ""
@@ -3100,9 +3365,37 @@ function DungeonFarm.normalizedUID(value)
     return tostring(value)
 end
 
+function DungeonFarm.getTeamPetCount(team)
+    local uids = type(team) == "table" and team.UIDs or nil
+    if type(uids) ~= "table" then
+        return 0
+    end
+
+    local count = 0
+    local amount = DungeonFarm.getEquipSlotCount()
+    if amount > 0 then
+        for slot = 1, amount do
+            if DungeonFarm.normalizedUID(uids[slot] or uids[tostring(slot)]) ~= "" then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
+    for slot, uid in pairs(uids) do
+        if tonumber(slot) and DungeonFarm.normalizedUID(uid) ~= "" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
 function DungeonFarm.teamPetsMatch(team)
     local amount = DungeonFarm.getEquipSlotCount()
     if amount < 1 then
+        return false
+    end
+    if DungeonFarm.getEquippedPetCount() == 0 then
         return false
     end
     local equipped = getStoreTable("EquippedPets", true)
@@ -3171,19 +3464,51 @@ local function applyDungeonTeam(index)
         return false, reason
     end
 
-    for attempt = 1, 10 do
+    local function invokeTeam(teamIndex)
         local called, callError = pcall(function()
-            equipTeam(index)
+            equipTeam(teamIndex)
         end)
         if not called then
             return false, "Goi native equip_team loi: " .. tostring(callError)
         end
         task.wait(0.35)
-        if DungeonFarm.teamPetsMatch(team) and DungeonFarm.teamLoadoutMatches(team) then
+        return true
+    end
+
+    local function waitForTeamPets(timeout)
+        local deadline = os.clock() + timeout
+        while alive() and os.clock() < deadline do
+            if DungeonFarm.teamPetsMatch(team) then
+                DungeonFarm.lastEquippedPetCount = DungeonFarm.getEquippedPetCount()
+                return true
+            end
+            DungeonFarm.lastEquippedPetCount = DungeonFarm.getEquippedPetCount()
+            task.wait(0.2)
+        end
+        return false
+    end
+
+    if DungeonFarm.teamPetsMatch(team) then
+        DungeonFarm.lastEquippedPetCount = DungeonFarm.getEquippedPetCount()
+        return true, team
+    end
+
+    -- Native equip_team updates the pet store asynchronously. Poll one request
+    -- to completion before retrying so each retry does not reset that sync.
+    for attempt = 1, 3 do
+        local called, callError = invokeTeam(index)
+        if not called then
+            return false, callError
+        end
+        if waitForTeamPets(3.5) then
             return true, team
         end
-        if attempt < 10 then
-            task.wait(0.25)
+
+        if not alive() then
+            return false, "Dungeon script da duoc reload trong luc doi team."
+        end
+        if attempt < 3 then
+            task.wait(0.5)
         end
     end
 
@@ -3281,10 +3606,19 @@ function DungeonFarm.ensureTeamApplied(index, role)
 
     if DungeonFarm.teamApplied and DungeonFarm.teamIndexApplied == index then
         local team = getStoreTable("PetTeams", true)[index]
-        if type(team) == "table"
-            and DungeonFarm.teamPetsMatch(team)
-            and DungeonFarm.teamLoadoutMatches(team) then
-            return true
+        if type(team) == "table" then
+            local deadline = os.clock() + 3
+            while alive() and os.clock() < deadline do
+                if DungeonFarm.getEquippedPetCount() > 0 and DungeonFarm.teamPetsMatch(team) then
+                    return true
+                end
+                task.wait(0.2)
+            end
+            -- A just-applied team can briefly disappear while the native store
+            -- republishes all slots. Let it settle before issuing another swap.
+            if os.clock() - (DungeonFarm.teamAppliedAt or 0) < 8 then
+                return false
+            end
         end
     end
     if DungeonFarm.teamApplying then
@@ -3295,9 +3629,12 @@ function DungeonFarm.ensureTeamApplied(index, role)
         if DungeonFarm.teamApplied and DungeonFarm.teamIndexApplied == index then
             local team = getStoreTable("PetTeams", true)[index]
             if type(team) == "table"
-                and DungeonFarm.teamPetsMatch(team)
-                and DungeonFarm.teamLoadoutMatches(team) then
+                and DungeonFarm.getEquippedPetCount() > 0
+                and DungeonFarm.teamPetsMatch(team) then
                 return true
+            end
+            if os.clock() - (DungeonFarm.teamAppliedAt or 0) < 8 then
+                return false
             end
         end
     end
@@ -3310,15 +3647,57 @@ function DungeonFarm.ensureTeamApplied(index, role)
         end
         return reason
     end)
-    DungeonFarm.teamApplying = false
     if ok and type(team) == "table" then
-        DungeonFarm.teamApplied = true
-        DungeonFarm.teamIndexApplied = index
-        DungeonFarm.lastMessage = "Da doi sang team " .. tostring(role or "dungeon") .. "."
-        return true
+        -- Do not call native equip_team again just because the authoritative
+        -- pet store reports a transient zero during synchronization. The native
+        -- team handler also owns the cosmetic loadout, so avoid sending those
+        -- remotes separately while its pet sync is still settling.
+        for _ = 1, 24 do
+            local currentTeam = getStoreTable("PetTeams", true)[index]
+            if type(currentTeam) ~= "table" then
+                currentTeam = team
+            end
+            local equippedCountNow = DungeonFarm.getEquippedPetCount()
+            if equippedCountNow > 0
+                and DungeonFarm.teamPetsMatch(currentTeam) then
+                DungeonFarm.teamApplying = false
+                DungeonFarm.teamApplied = true
+                DungeonFarm.teamIndexApplied = index
+                DungeonFarm.teamAppliedAt = os.clock()
+                DungeonFarm.lastEquippedPetCount = equippedCountNow
+                DungeonFarm.lastMessage = "Da doi sang team " .. tostring(role or "dungeon") .. "."
+                return true
+            end
+            task.wait(0.25)
+        end
     end
+    DungeonFarm.teamApplying = false
     DungeonFarm.teamApplied = false
     DungeonFarm.teamIndexApplied = nil
+    DungeonFarm.teamAppliedAt = 0
+    return false
+end
+
+function DungeonFarm.ensureEntryTeam(role)
+    local index = tonumber(dungeonSelection.normalTeamIndex)
+        or tonumber(dungeonSelection.teamIndex)
+        or 1
+    for attempt = 1, 5 do
+        DungeonFarm.updateStatus(
+            "Dungeon Farm: TEAM",
+            string.format(
+                "Dang dong bo team %d truoc khi vao dungeon (%d/5) | Pet %d",
+                index,
+                attempt,
+                DungeonFarm.getEquippedPetCount()
+            )
+        )
+        if DungeonFarm.ensureTeamApplied(index, role or "normal")
+            and DungeonFarm.getEquippedPetCount() > 0 then
+            return true
+        end
+        task.wait(0.5)
+    end
     return false
 end
 
@@ -3464,19 +3843,54 @@ function DungeonFarm.findPrompt(dungeon)
                 end
             end
         end
+    end
+
+    -- A valid route with no actionable prompt means the route rooms are waiting
+    -- on combat/chest/door, which the caller handles before reaching here.
+    -- Stay on route instead of wandering into unrelated rooms.
+    if goldEntry and #DungeonFarm.route > 0 then
         return nil
     end
 
-    -- Wait for the native map/door data when a route is not available yet.
+    -- No path to the gold target yet: reveal toward gold, not just the nearest
+    -- room, so the server exposes the missing connection without clearing
+    -- unrelated branches.
+    local character = LocalPlayer.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    local rootPos = root and root.Position or nil
+    local bestPrompt, bestRoom, bestPart, bestKey
+    local bestGoldDist, bestPlayerDist = math.huge, math.huge
     for _, entry in ipairs(rooms) do
         if entry.room.Parent and not DungeonFarm.completed[entry.key] then
             local prompt, part = DungeonFarm.getRoomConfirmPrompt(entry.room)
             if prompt then
-                return prompt, entry.room, part, entry.key
+                local goldDist = math.huge
+                if goldEntry then
+                    goldDist = math.abs(entry.x - goldEntry.x) + math.abs(entry.y - goldEntry.y)
+                elseif #DungeonFarm.goldRooms > 0 then
+                    for _, gold in ipairs(DungeonFarm.goldRooms) do
+                        local dist = math.abs(entry.x - gold.x) + math.abs(entry.y - gold.y)
+                        if dist < goldDist then
+                            goldDist = dist
+                        end
+                    end
+                else
+                    goldDist = 0
+                end
+                local playerDist = rootPos and (entry.center - rootPos).Magnitude or 0
+                if goldDist < bestGoldDist
+                    or (goldDist == bestGoldDist and playerDist < bestPlayerDist) then
+                    bestPrompt = prompt
+                    bestRoom = entry.room
+                    bestPart = part
+                    bestKey = entry.key
+                    bestGoldDist = goldDist
+                    bestPlayerDist = playerDist
+                end
             end
         end
     end
-    return nil
+    return bestPrompt, bestRoom, bestPart, bestKey
 end
 
 function DungeonFarm.getConfirmPartState(dungeon)
@@ -3568,6 +3982,33 @@ function DungeonFarm.isGoldDoorPart(part)
     return math.abs(color.R - 0.85098) <= 0.03
         and math.abs(color.G - 0.713726) <= 0.03
         and math.abs(color.B - 0.219608) <= 0.03
+end
+
+function DungeonFarm.markRoomCleared(room, explicitKey)
+    local key = explicitKey
+    if not key and room and room.Parent then
+        key = room:GetFullName()
+    end
+    if not key then
+        return
+    end
+
+    DungeonFarm.completed[key] = true
+    if DungeonFarm.goldRoomKeys[key] then
+        DungeonFarm.goldRoomsOpened[key] = true
+        -- Force the next route calculation to choose the next unfinished gold room.
+        if DungeonFarm.goldTargetKey == key then
+            DungeonFarm.goldTargetKey = nil
+            DungeonFarm.goldTargetRoom = nil
+            DungeonFarm.routeTarget = nil
+            DungeonFarm.routeKey = ""
+            DungeonFarm.route = {}
+        end
+    end
+    if DungeonFarm.targetRoom == room then
+        DungeonFarm.targetRoom = nil
+        DungeonFarm.targetPart = nil
+    end
 end
 
 function DungeonFarm.getRouteRooms(dungeon)
@@ -3798,12 +4239,16 @@ function DungeonFarm.rebuildRoute(dungeon)
 
     local distances = shortestDistances(startEntry)
     local goldEntry = DungeonFarm.goldTargetKey and entryByKey[DungeonFarm.goldTargetKey] or nil
+    if goldEntry and DungeonFarm.completed[goldEntry.key] then
+        goldEntry = nil
+        DungeonFarm.goldTargetKey = nil
+    end
     if not goldEntry then
         local bestDistance = math.huge
         local bestTie = math.huge
         for _, entry in ipairs(goldEntries) do
             local distance = distances[entry.key]
-            if distance ~= nil then
+            if not DungeonFarm.completed[entry.key] and distance ~= nil then
                 local tie = startEntry
                     and math.abs(entry.x - startEntry.x) + math.abs(entry.y - startEntry.y)
                     or math.huge
@@ -3817,6 +4262,8 @@ function DungeonFarm.rebuildRoute(dungeon)
         end
         if goldEntry then
             DungeonFarm.goldTargetKey = goldEntry.key
+        else
+            DungeonFarm.goldTargetKey = nil
         end
     end
 
@@ -4266,17 +4713,68 @@ function DungeonFarm.getChestTargets(dungeon)
 end
 
 function DungeonFarm.isGoldRunComplete(dungeon)
-    local target = DungeonFarm.routeTarget
-    if not (target and target.Parent and DungeonFarm.goldTargetKey) then
+    if #DungeonFarm.goldRooms == 0 then
         return false
     end
-    if not DungeonFarm.completed[target:GetFullName()] then
-        return false
+
+    for _, entry in ipairs(DungeonFarm.goldRooms) do
+        if not DungeonFarm.completed[entry.key] then
+            return false
+        end
     end
-    if DungeonFarm.findGoldDoor(dungeon) then
-        return false
-    end
+
     return #DungeonFarm.getChestTargets(dungeon) == 0
+end
+
+function DungeonFarm.roomHasChestObject(room)
+    if not room then
+        return false
+    end
+    for _, object in ipairs(room:GetDescendants()) do
+        if CollectionService:HasTag(object, "Chest")
+            or (object:IsA("Model") and object.Name == "Closed Chest") then
+            return true
+        end
+    end
+    return false
+end
+
+function DungeonFarm.reconcileCurrentGoldRoom(dungeon)
+    local target = DungeonFarm.goldTargetRoom
+    if not (target and target.Parent and DungeonFarm.goldRoomKeys[target:GetFullName()]) then
+        return false
+    end
+
+    local rooms = DungeonFarm.getRouteRooms(dungeon)
+    local current = DungeonFarm.findCurrentMapRoom(rooms)
+    if not (current and current.room == target) then
+        DungeonFarm.goldRoomEmptySince[target:GetFullName()] = nil
+        return false
+    end
+
+    local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+    local hasConfirm = DungeonFarm.getRoomConfirmPrompt(target) ~= nil
+    local hasDoor = DungeonFarm.roomHasPendingGoldDoor(target)
+    local hasChest = DungeonFarm.roomHasChestObject(target)
+    local key = target:GetFullName()
+    if #liveEnemies > 0 or uncertainEnemies or hasConfirm or hasDoor or hasChest then
+        DungeonFarm.goldRoomEmptySince[key] = nil
+        return false
+    end
+
+    local now = os.clock()
+    local emptySince = DungeonFarm.goldRoomEmptySince[key] or now
+    DungeonFarm.goldRoomEmptySince[key] = emptySince
+    if now - emptySince < 6 then
+        return false
+    end
+
+    -- A rejoin can resume inside an already-cleared gold room with no prompt or enemy.
+    DungeonFarm.markRoomCleared(target)
+    DungeonFarm.goldRoomEmptySince[key] = nil
+    DungeonFarm.lastMessage = "Da xac nhan room vang " .. tostring(target.Name) .. "."
+    DungeonFarm.updateStatus("Dungeon Farm: GOLD DONE", DungeonFarm.lastMessage)
+    return true
 end
 
 function DungeonFarm.enemyCount(dungeon)
@@ -4421,7 +4919,7 @@ function DungeonFarm.flyTo(targetPart, token)
     return reached
 end
 
-function DungeonFarm.isLiveEnemy(enemy, enemies, forceProbe)
+function DungeonFarm.isLiveEnemy(enemy, enemies, _forceProbe)
     if not (enemy and enemy.Parent == enemies and enemy:IsA("Model")) then
         return false, false
     end
@@ -4442,36 +4940,21 @@ function DungeonFarm.isLiveEnemy(enemy, enemies, forceProbe)
     end
 
     local health = Feature.getHealth(enemy)
-    local attackable = CollectionService:HasTag(enemy, "Attackable")
+    local attackable = false
+    pcall(function()
+        attackable = CollectionService:HasTag(enemy, "Attackable")
+    end)
     if health ~= nil and health <= 0 then
         return false, false
-    end
-    -- A dead model can keep a stale positive Health value after Attackable is removed.
-    -- Ask the game's local-health endpoint before trusting a stale Attackable tag.
-    if GetLocalEnemyHealth then
-        local lastProbe = DungeonFarm.enemyHealthProbeAt[enemy] or 0
-        local probeInterval = forceProbe and 0.25 or 1
-        if now - lastProbe >= probeInterval then
-            DungeonFarm.enemyHealthProbeAt[enemy] = now
-            local ok, serverHealth = pcall(function()
-                return GetLocalEnemyHealth:InvokeServer(enemy)
-            end)
-            serverHealth = ok and tonumber(serverHealth) or nil
-            if serverHealth ~= nil then
-                local healthValue = enemy:FindFirstChild("Health", true)
-                if healthValue and healthValue:IsA("NumberValue") then
-                    healthValue.Value = serverHealth
-                end
-                return serverHealth > 0, false
-            end
-        end
     end
 
     if attackable then
         return true, false
     end
 
-    if now - DungeonFarm.enemySeenAt[enemy] < 3 then
+    -- Attackable is added by the game's local enemy handler after spawn. Give it
+    -- a short settle window, then treat an untagged model as stale.
+    if now - DungeonFarm.enemySeenAt[enemy] < 4 then
         return false, true
     end
     return false, false
@@ -4492,6 +4975,9 @@ function DungeonFarm.getLiveEnemies(dungeon)
             uncertain = true
         end
     end
+    DungeonFarm.lastLiveScanAt = os.clock()
+    DungeonFarm.lastLiveScanCount = #result
+    DungeonFarm.lastLiveScanUncertain = uncertain
     return result, uncertain
 end
 
@@ -4505,13 +4991,36 @@ function DungeonFarm.clearEnemies(dungeon, token)
         return false, "Bindable.SendPet khong ton tai."
     end
 
+    local function prepareEnemy(enemy)
+        if not (enemy and enemy.Parent == enemies and enemy:IsA("Model")) then
+            return false
+        end
+        local primary = enemy.PrimaryPart
+            or enemy:FindFirstChild("HumanoidRootPart", true)
+            or enemy:FindFirstChild("RootPart", true)
+        if primary and primary:IsA("BasePart") and not enemy.PrimaryPart then
+            pcall(function()
+                enemy.PrimaryPart = primary
+            end)
+        end
+        return enemy.PrimaryPart ~= nil and enemy:FindFirstChild("Attackers") ~= nil
+    end
+
     local function sendToEnemy(enemy)
+        if not prepareEnemy(enemy) then
+            return false, "Enemy chua san sang target."
+        end
         local ok, err = pcall(function()
             sendEvent:Fire(enemy, true, true)
         end)
         if not ok then
+            DungeonFarm.lastCombatError = tostring(err)
             return false, "Gui pet loi: " .. tostring(err)
         end
+        DungeonFarm.lastCombatTarget = enemy:GetFullName()
+        DungeonFarm.lastCombatSendAt = os.clock()
+        DungeonFarm.combatSendCount = DungeonFarm.combatSendCount + 1
+        DungeonFarm.lastCombatError = ""
         return true
     end
 
@@ -4537,8 +5046,34 @@ function DungeonFarm.clearEnemies(dungeon, token)
             return true, "Da clear enemy."
         end
 
-        -- Hold one target until it dies so movement never skips ahead to another enemy.
-        local enemy = enemyList[1]
+        -- Pick the nearest READY target first so one unspawned model never
+        -- blocks the rest of the room while the player stands still.
+        local selfRoot = LocalPlayer.Character
+            and (LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or LocalPlayer.Character.PrimaryPart)
+        local selfPos = selfRoot and selfRoot.Position or nil
+        table.sort(enemyList, function(a, b)
+            if not selfPos then
+                return tostring(a:GetFullName()) < tostring(b:GetFullName())
+            end
+            local pa = DungeonFarm.getTargetPosition(a)
+            local pb = DungeonFarm.getTargetPosition(b)
+            local da = pa and (pa - selfPos).Magnitude or math.huge
+            local db = pb and (pb - selfPos).Magnitude or math.huge
+            return da < db
+        end)
+        local enemy = nil
+        for _, candidate in ipairs(enemyList) do
+            if prepareEnemy(candidate) then
+                enemy = candidate
+                break
+            end
+        end
+        if not enemy then
+            -- Nothing ready yet (models still spawning): wait briefly and rescan
+            -- instead of holding a dead handle while other enemies stay idle.
+            task.wait(0.5)
+            continue
+        end
         DungeonFarm.updateStatus(
             "Dungeon Farm: COMBAT",
             string.format(
@@ -4553,6 +5088,9 @@ function DungeonFarm.clearEnemies(dungeon, token)
         end
 
         local lastSend = 0
+        local notReadySince = nil
+        local droppedNotReady = false
+        local lastFlyCheck = os.clock()
         local targetLive, targetUnknown = DungeonFarm.isLiveEnemy(enemy, enemies, true)
         while targetLive or targetUnknown do
             if not alive() or token ~= DungeonFarm.token or not DungeonFarm.enabled then
@@ -4566,12 +5104,33 @@ function DungeonFarm.clearEnemies(dungeon, token)
             end
 
             -- Re-send only to the current target while it remains alive.
+            -- If it never becomes ready, drop it and re-pick instead of
+            -- standing still while the rest of the room stays idle.
             if os.clock() - lastSend >= 1 then
                 local ok, reason = sendToEnemy(enemy)
-                if not ok then
+                if not ok and reason ~= "Enemy chua san sang target." then
                     return false, reason
                 end
-                lastSend = os.clock()
+                if ok then
+                    lastSend = os.clock()
+                    notReadySince = nil
+                elseif notReadySince == nil then
+                    notReadySince = os.clock()
+                elseif os.clock() - notReadySince >= 6 then
+                    droppedNotReady = true
+                    break
+                end
+            end
+
+            -- The target can walk away while pets chase it: re-fly when far.
+            if os.clock() - lastFlyCheck >= 3 then
+                lastFlyCheck = os.clock()
+                local myRoot = LocalPlayer.Character
+                    and (LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or LocalPlayer.Character.PrimaryPart)
+                local enemyPos = DungeonFarm.getTargetPosition(enemy)
+                if myRoot and enemyPos and (myRoot.Position - enemyPos).Magnitude > 30 then
+                    DungeonFarm.flyTo(enemy, token)
+                end
             end
 
             targetLive, targetUnknown = DungeonFarm.isLiveEnemy(enemy, enemies, true)
@@ -4589,7 +5148,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
             task.wait(0.25)
         end
 
-        if not targetUnknown then
+        if not targetUnknown and not droppedNotReady then
             -- Exclude the dead model immediately so the next pass picks a fresh target.
             DungeonFarm.deadEnemies[enemy] = true
         end
@@ -4598,7 +5157,8 @@ function DungeonFarm.clearEnemies(dungeon, token)
         DungeonFarm.updateStatus(
             "Dungeon Farm: COMBAT",
             string.format(
-                "Room %s | Da ha %s | Chuyen muc tieu | Con %d enemy",
+                droppedNotReady and "Room %s | Bo qua %s chua san sang | Con %d enemy"
+                    or "Room %s | Da ha %s | Chuyen muc tieu | Con %d enemy",
                 tostring(DungeonFarm.room or "?"),
                 tostring(enemy.Name),
                 DungeonFarm.lastEnemyCount
@@ -4687,7 +5247,9 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
         return false, "Instant interaction cua vang loi: " .. tostring(err)
     end
 
-    local deadline = os.clock() + 20
+    local deadline = os.clock() + 25
+    local lastFire = 0
+    local fireCount = 0
     while alive() and token == DungeonFarm.token and DungeonFarm.enabled do
         if not prompt.Parent or not prompt.Enabled then
             DungeonFarm.goldDoorsOpened[key] = true
@@ -4696,11 +5258,40 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
             if DungeonFarm.routeTarget and DungeonFarm.doorLeadsToGoldTarget(door, room, DungeonFarm.getDungeon()) then
                 DungeonFarm.targetRoom = DungeonFarm.routeTarget
                 DungeonFarm.room = DungeonFarm.routeTarget.Name
+                DungeonFarm.goldRoomsOpened[DungeonFarm.routeTarget:GetFullName()] = true
+                -- The next loop iteration enforces the gold team via the
+                -- combat/chest path, so a transient sync flap here must not
+                -- abort the run right after the door opened.
+                local targetTeamIndex, targetRole = DungeonFarm.getRoomTeamIndex(DungeonFarm.routeTarget)
+                if not DungeonFarm.ensureTeamApplied(targetTeamIndex, targetRole) then
+                    DungeonFarm.lastMessage = "Da mo cua vang, dang thu lai team gold."
+                    DungeonFarm.updateStatus("Dungeon Farm: TEAM", DungeonFarm.lastMessage)
+                end
             end
             return true, "Da mo cua vang."
         end
         if os.clock() >= deadline then
             break
+        end
+        -- Single-fire was fragile: lag or drift left the prompt enabled and
+        -- the farm stood still before the gold door. Keep firing while in
+        -- range and re-fly when knocked away.
+        if os.clock() - lastFire >= 1 then
+            lastFire = os.clock()
+            fireCount = fireCount + 1
+            local myRoot = LocalPlayer.Character
+                and (LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or LocalPlayer.Character.PrimaryPart)
+            local doorPos = DungeonFarm.getTargetPosition(door)
+            if myRoot and doorPos and (myRoot.Position - doorPos).Magnitude > 18 then
+                DungeonFarm.updateStatus(
+                    "Dungeon Farm: GOLD DOOR",
+                    string.format("Bi day khoi cua vang, bay lai (%d)...", fireCount)
+                )
+                DungeonFarm.flyTo(door, token)
+            end
+            pcall(function()
+                fireproximityprompt(prompt)
+            end)
         end
         task.wait(0.25)
     end
@@ -4735,6 +5326,11 @@ function DungeonFarm.fail(reason, token)
 end
 
 function DungeonFarm.start()
+    if tostring(getPlayerValue("World", "")) == "Dungeon" then
+        -- Recover state when the player entered manually or the world callback ran first.
+        dungeonActive = true
+        DungeonFarm.entered = true
+    end
     if not DungeonFarm.enabled or not dungeonActive then
         return
     end
@@ -4757,8 +5353,14 @@ function DungeonFarm.start()
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
-    DungeonFarm.enemyHealthProbeAt = {}
     DungeonFarm.enemySeenAt = {}
+    DungeonFarm.lastCombatTarget = nil
+    DungeonFarm.lastCombatSendAt = 0
+    DungeonFarm.combatSendCount = 0
+    DungeonFarm.lastCombatError = ""
+    DungeonFarm.lastLiveScanAt = 0
+    DungeonFarm.lastLiveScanCount = 0
+    DungeonFarm.lastLiveScanUncertain = false
     DungeonFarm.deadEnemies = {}
     DungeonFarm.route = {}
     DungeonFarm.routeKey = ""
@@ -4767,9 +5369,16 @@ function DungeonFarm.start()
     DungeonFarm.goldTargetRoom = nil
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
+    DungeonFarm.goldRoomEmptySince = {}
+    DungeonFarm.lastEquippedPetCount = DungeonFarm.getEquippedPetCount()
+    DungeonFarm.teamApplied = false
+    DungeonFarm.teamApplying = false
+    DungeonFarm.teamIndexApplied = nil
+    DungeonFarm.teamAppliedAt = 0
     DungeonFarm.startedAt = os.clock()
     DungeonFarm.lastMessage = "Dang tim ConfirmPart active."
 
+    local entryTeamReady = false
     task.spawn(function()
         while alive() and dungeonActive and DungeonFarm.enabled and token == DungeonFarm.token do
             if tostring(getPlayerValue("World", "")) ~= "Dungeon" then
@@ -4785,18 +5394,65 @@ function DungeonFarm.start()
                 DungeonFarm.updateStatus("Dungeon Farm: CHO", "Dang cho map Dungeon load...")
                 task.wait(0.5)
             else
+                if not entryTeamReady then
+                    local entryTeamIndex, entryTeamRole = DungeonFarm.getRoomTeamIndex(DungeonFarm.targetRoom)
+                    DungeonFarm.phase = "team_retry"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: TEAM",
+                        string.format(
+                            "Dang dong bo team %d truoc khi farm | Pet %d",
+                            entryTeamIndex,
+                            DungeonFarm.getEquippedPetCount()
+                        )
+                    )
+                    if not DungeonFarm.ensureTeamApplied(entryTeamIndex, entryTeamRole or "normal")
+                        or DungeonFarm.getEquippedPetCount() == 0 then
+                        DungeonFarm.lastMessage = "Dang thu lai equip team truoc khi farm."
+                        task.wait(0.5)
+                        continue
+                    end
+                    entryTeamReady = true
+                end
+
+                if DungeonFarm.getEquippedPetCount() == 0 then
+                    local recoveryIndex, recoveryRole = DungeonFarm.getRoomTeamIndex(DungeonFarm.targetRoom)
+                    DungeonFarm.phase = "team_recovery"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: TEAM LAI",
+                        string.format("EquippedPets = 0 | dang nap lai team %d...", recoveryIndex)
+                    )
+                    if not DungeonFarm.ensureTeamApplied(recoveryIndex, recoveryRole or "normal")
+                        or DungeonFarm.getEquippedPetCount() == 0 then
+                        entryTeamReady = false
+                        DungeonFarm.lastMessage = "Dang thu lai vi EquippedPets van dang 0."
+                        task.wait(0.5)
+                        continue
+                    end
+                end
                 DungeonFarm.rebuildRoute(dungeon)
+                if DungeonFarm.reconcileCurrentGoldRoom(dungeon) then
+                    task.wait(0.1)
+                    continue
+                end
                 local enemies = dungeon:FindFirstChild("Enemies")
                 local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
                 if #liveEnemies > 0 or uncertainEnemies then
-                    local combatRoom = DungeonFarm.targetRoom
-                    if not combatRoom then
-                        local _, currentEntry = DungeonFarm.rebuildRoute(dungeon)
+                    local _, currentEntry = DungeonFarm.rebuildRoute(dungeon)
+                    local combatRoom = DungeonFarm.targetRoom or (currentEntry and currentEntry.room)
+                    if combatRoom then
+                        DungeonFarm.targetRoom = combatRoom
+                        DungeonFarm.room = combatRoom.Name
+                    else
                         combatRoom = currentEntry and currentEntry.room or nil
                     end
+                    -- Team sync can flap for a few seconds after a swap: retry the
+                    -- loop instead of aborting the whole run and standing still.
                     if not DungeonFarm.ensureRoomTeam(combatRoom) then
-                        DungeonFarm.fail("Khong doi duoc team cho room dang combat.", token)
-                        return
+                        DungeonFarm.phase = "team_retry"
+                        DungeonFarm.lastMessage = "Dang thu lai equip team cho room combat."
+                        DungeonFarm.updateStatus("Dungeon Farm: TEAM", DungeonFarm.lastMessage)
+                        task.wait(1)
+                        continue
                     end
                     DungeonFarm.phase = "combat"
                     local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
@@ -4804,11 +5460,31 @@ function DungeonFarm.start()
                         DungeonFarm.fail(reason, token)
                         return
                     end
+                    DungeonFarm.markRoomCleared(combatRoom)
+                    -- The global enemy list carries no room tag, so a stale
+                    -- targetRoom could mark the wrong room and hide the gold
+                    -- door behind a room that never completes. Mark the room
+                    -- the player is actually standing in as well.
+                    if currentEntry and currentEntry.room and currentEntry.room ~= combatRoom then
+                        DungeonFarm.markRoomCleared(currentEntry.room)
+                    end
                 else
                     local chests = DungeonFarm.getChestTargets(dungeon)
                     if #chests > 0 then
                         local map = dungeon:FindFirstChild("Map")
                         local chestRoom = map and DungeonFarm.findRoom(chests[1], map) or nil
+                        local chestRooms = {}
+                        if map then
+                            for _, chest in ipairs(chests) do
+                                local room = DungeonFarm.findRoom(chest, map)
+                                if room then
+                                    chestRooms[room] = true
+                                end
+                            end
+                        end
+                        if chestRoom then
+                            DungeonFarm.room = chestRoom.Name
+                        end
                         local chestTeamIndex, chestRole = DungeonFarm.getRoomTeamIndex(chestRoom)
                         if DungeonFarm.goldContentActive then
                             chestTeamIndex = tonumber(dungeonSelection.goldTeamIndex)
@@ -4817,14 +5493,20 @@ function DungeonFarm.start()
                             chestRole = "gold"
                         end
                         if not DungeonFarm.ensureTeamApplied(chestTeamIndex, chestRole) then
-                            DungeonFarm.fail("Khong doi duoc team cho room chest.", token)
-                            return
+                            DungeonFarm.phase = "team_retry"
+                            DungeonFarm.lastMessage = "Dang thu lai equip team cho room chest."
+                            DungeonFarm.updateStatus("Dungeon Farm: TEAM", DungeonFarm.lastMessage)
+                            task.wait(1)
+                            continue
                         end
                         DungeonFarm.phase = "chest"
                         local ok, reason = DungeonFarm.clearChests(dungeon, token)
                         if not ok then
                             DungeonFarm.fail(reason, token)
                             return
+                        end
+                        for room in pairs(chestRooms) do
+                            DungeonFarm.markRoomCleared(room)
                         end
                     else
                         if DungeonFarm.isGoldRunComplete(dungeon) then
@@ -4838,8 +5520,11 @@ function DungeonFarm.start()
                         local doorPrompt, doorPart, doorRoom = DungeonFarm.findGoldDoor(dungeon)
                         if doorPrompt then
                             if not DungeonFarm.ensureRoomTeam(doorRoom) then
-                                DungeonFarm.fail("Khong doi duoc team cho room mo cua vang.", token)
-                                return
+                                DungeonFarm.phase = "team_retry"
+                                DungeonFarm.lastMessage = "Dang thu lai equip team truoc cua vang."
+                                DungeonFarm.updateStatus("Dungeon Farm: TEAM", DungeonFarm.lastMessage)
+                                task.wait(1)
+                                continue
                             end
                             local ok, reason = DungeonFarm.openGoldDoor(doorPrompt, doorPart, doorRoom, token)
                             if not ok then
@@ -4980,7 +5665,7 @@ function DungeonFarm.start()
                                     end
                                 end
 
-                                DungeonFarm.completed[key] = true
+                                DungeonFarm.markRoomCleared(room, key)
                                 DungeonFarm.attempts[key] = nil
                                 DungeonFarm.lastMessage = "Da clear room " .. tostring(room.Name) .. "."
                                 DungeonFarm.phase = "waiting"
@@ -5021,8 +5706,14 @@ local function restoreDungeonSession(reason)
     DungeonFarm.goldDoorsOpened = {}
     DungeonFarm.goldRoomsOpened = {}
     DungeonFarm.completedChests = {}
-    DungeonFarm.enemyHealthProbeAt = {}
     DungeonFarm.enemySeenAt = {}
+    DungeonFarm.lastCombatTarget = nil
+    DungeonFarm.lastCombatSendAt = 0
+    DungeonFarm.combatSendCount = 0
+    DungeonFarm.lastCombatError = ""
+    DungeonFarm.lastLiveScanAt = 0
+    DungeonFarm.lastLiveScanCount = 0
+    DungeonFarm.lastLiveScanUncertain = false
     DungeonFarm.deadEnemies = {}
     DungeonFarm.route = {}
     DungeonFarm.routeKey = ""
@@ -5031,9 +5722,11 @@ local function restoreDungeonSession(reason)
     DungeonFarm.goldTargetRoom = nil
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
+    DungeonFarm.goldRoomEmptySince = {}
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
     DungeonFarm.teamIndexApplied = nil
+    DungeonFarm.teamAppliedAt = 0
     DungeonFarm.lastMessage = reason or "Da khoi phuc cau hinh"
     DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", DungeonFarm.lastMessage)
     dungeonWaiting = false
@@ -5059,12 +5752,21 @@ local function restoreDungeonSession(reason)
             if session.location and session.location.world then
                 travelToWorld(session.location.world)
             end
-            applyEquippedPets(session.equippedPets)
-            applyDungeonTitle(session.title)
-            applyDungeonAvatar(session.avatar)
-            applyDungeonAura(session.aura)
-            applyDungeonArtifact(session.artifact, "CurrentArtefact")
-            applyDungeonArtifact(session.secondArtifact, "CurrentSecondArtefact")
+
+            -- The native team handler restores pets and its saved cosmetics as
+            -- one transaction; direct remotes can clear the pet store mid-sync.
+            local restoredTeam = false
+            if session.teamIndex then
+                restoredTeam = DungeonFarm.ensureTeamApplied(session.teamIndex, "restore") == true
+            end
+            if not restoredTeam then
+                applyEquippedPets(session.equippedPets)
+                applyDungeonTitle(session.title)
+                applyDungeonAvatar(session.avatar)
+                applyDungeonAura(session.aura)
+                applyDungeonArtifact(session.artifact, "CurrentArtefact")
+                applyDungeonArtifact(session.secondArtifact, "CurrentSecondArtefact")
+            end
             local dungeonSettings = type(session.dungeonSettings) == "table" and session.dungeonSettings or {}
             if dungeonSettings.Theme then
                 protectedCall("Restore dungeon theme", function()
@@ -5100,7 +5802,7 @@ function DungeonFarm.leaveAfterGold(token)
         return false, "Dungeon farm token da thay doi."
     end
     DungeonFarm.phase = "leaving"
-    DungeonFarm.updateStatus("Dungeon Farm: OUT", "Da clear room vang; dang roi Dungeon...")
+    DungeonFarm.updateStatus("Dungeon Farm: OUT", "Da clear tat ca room vang; dang roi Dungeon...")
 
     local ok, reason = protectedCall("Leave dungeon after gold room", function()
         local travelEvent = Bindable:FindFirstChild("AttemptTravel")
@@ -5135,12 +5837,15 @@ local function startAutoDungeon()
     dungeonSelection.mapId = normalizeDungeonMapId(dungeonSelection.mapId) or "DBZ"
     if tostring(getPlayerValue("World", "")) == "Dungeon" then
         dungeonActive = true
-        if not DungeonFarm.ensureTeamApplied() then
-            DungeonFarm.updateStatus("Dungeon Farm: LOI", "Khong doi duoc team dungeon.")
-            return
-        end
+        local entryTeamReady = DungeonFarm.ensureEntryTeam("after-entry")
         DungeonFarm.entered = true
         if DungeonFarm.enabled then
+            if not entryTeamReady then
+                DungeonFarm.updateStatus(
+                    "Dungeon Farm: TEAM LAI",
+                    "Dang o Dungeon; farm se thu lai equip team truoc khi active room."
+                )
+            end
             DungeonFarm.start()
         else
             DungeonFarm.updateStatus("Dungeon Farm: TAT", "Farm dungeon dang tat.")
@@ -5222,9 +5927,14 @@ local function startAutoDungeon()
         return
     end
 
+    local previousEquippedPets = copyEquippedPets()
+    local previousTeamIndex = findTeamIndexForEquipped(previousEquippedPets)
+    local previousTeam = previousTeamIndex and getStoreTable("PetTeams", true)[previousTeamIndex] or nil
     dungeonSession = {
         location = captureLocation(),
-        equippedPets = copyEquippedPets(),
+        equippedPets = previousEquippedPets,
+        teamIndex = previousTeamIndex,
+        teamName = type(previousTeam) == "table" and previousTeam.Name or nil,
         title = getStoreValue("CurrentTitle", true, "") or "",
         avatar = getStoreValue("CurrentAvatar", true, "") or getPlayerValue("CurrentAvatar", "") or "",
         aura = getStoreValue("CurrentAura", true, "") or "",
@@ -5255,6 +5965,7 @@ local function startAutoDungeon()
     DungeonFarm.goldTargetRoom = nil
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
+    DungeonFarm.goldRoomEmptySince = {}
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
     DungeonFarm.teamIndexApplied = nil
@@ -5296,9 +6007,15 @@ local function startAutoDungeon()
             end)
             if checkOK and arrived then
                 DungeonFarm.updateStatus("Dungeon Farm: TEAM", "Da vao dungeon; dang doi team da cai dat...")
-                if not DungeonFarm.ensureTeamApplied() then
-                    DungeonFarm.fail("Khong doi duoc team dungeon sau khi vao map.")
-                    return
+                if not DungeonFarm.ensureEntryTeam("after-entry")
+                    or DungeonFarm.getEquippedPetCount() == 0 then
+                    DungeonFarm.phase = "team_retry"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: TEAM LAI",
+                        "Da vao dungeon nhung EquippedPets chua san sang; dang thu lai..."
+                    )
+                    task.wait(0.5)
+                    continue
                 end
                 DungeonFarm.entered = true
                 notifyStatus("Auto Dungeon", "Da vao dungeon: " .. dungeonSelection.mapId)
@@ -5349,6 +6066,21 @@ local function startAutoDungeon()
             end
 
             if not activeSeen then
+                DungeonFarm.phase = "entry_team"
+                DungeonFarm.updateStatus(
+                    "Dungeon Farm: TEAM TRUOC",
+                    "Dungeon da mo; dang equip team truoc khi vao..."
+                )
+                if not DungeonFarm.ensureEntryTeam("before-entry")
+                    or DungeonFarm.getEquippedPetCount() == 0 then
+                    DungeonFarm.phase = "entry_team_retry"
+                    DungeonFarm.updateStatus(
+                        "Dungeon Farm: TEAM LAI",
+                        "Chua xac nhan du pet; chua teleport vao dungeon."
+                    )
+                    task.wait(0.5)
+                    continue
+                end
                 activeSeen = true
                 lastTravelAttempt = os.clock()
                 protectedCall("Travel to active dungeon", function()
@@ -5395,6 +6127,22 @@ globalEnv.__auto_clone_debug.setDungeon = function(mapId, mode, size, teamIndex)
     Feature.autoDungeonEnabled = true
     return startAutoDungeon()
 end
+globalEnv.__auto_clone_debug.checkTeam = function(teamIndex)
+    local index = math.max(1, math.floor(tonumber(teamIndex) or dungeonSelection.normalTeamIndex or 1))
+    local started = os.clock()
+    local callOK, applied = protectedCall("Debug dungeon team check", function()
+        return DungeonFarm.ensureTeamApplied(index, "debug")
+    end)
+    return {
+        requested = index,
+        callOK = callOK,
+        applied = applied == true,
+        elapsed = os.clock() - started,
+        equippedPetCount = DungeonFarm.getEquippedPetCount(),
+        teamApplied = DungeonFarm.teamApplied,
+        teamIndexApplied = DungeonFarm.teamIndexApplied
+    }
+end
 globalEnv.__auto_clone_debug.state = function()
     return {
         mapId = dungeonSelection.mapId,
@@ -5403,9 +6151,37 @@ globalEnv.__auto_clone_debug.state = function()
         teamIndex = dungeonSelection.teamIndex,
         normalTeamIndex = dungeonSelection.normalTeamIndex,
         goldTeamIndex = dungeonSelection.goldTeamIndex,
+        goldTargetKey = DungeonFarm.goldTargetKey,
+        goldTargetRoom = DungeonFarm.goldTargetRoom and DungeonFarm.goldTargetRoom.Name or nil,
+        goldRoomCount = #DungeonFarm.goldRooms,
+        goldCompletedCount = (function()
+            local count = 0
+            for _, entry in ipairs(DungeonFarm.goldRooms) do
+                if DungeonFarm.completed[entry.key] then
+                    count = count + 1
+                end
+            end
+            return count
+        end)(),
+        goldContentActive = DungeonFarm.goldContentActive,
         world = tostring(getPlayerValue("World", "")),
         dungeonActive = dungeonActive,
         dungeonWaiting = dungeonWaiting,
+        autoDungeonEnabled = Feature.autoDungeonEnabled,
+        farmEnabled = DungeonFarm.enabled,
+        dungeonEntered = DungeonFarm.entered,
+        dungeonRunning = DungeonFarm.running,
+        equippedPetCount = DungeonFarm.getEquippedPetCount(),
+        teamApplied = DungeonFarm.teamApplied,
+        teamApplying = DungeonFarm.teamApplying,
+        teamIndexApplied = DungeonFarm.teamIndexApplied,
+        teamAppliedAge = DungeonFarm.teamAppliedAt > 0 and (os.clock() - DungeonFarm.teamAppliedAt) or nil,
+        combatTarget = DungeonFarm.lastCombatTarget,
+        combatSendCount = DungeonFarm.combatSendCount,
+        combatSendAge = DungeonFarm.lastCombatSendAt > 0 and (os.clock() - DungeonFarm.lastCombatSendAt) or nil,
+        combatError = DungeonFarm.lastCombatError,
+        liveEnemyCount = DungeonFarm.lastLiveScanCount,
+        liveEnemyUncertain = DungeonFarm.lastLiveScanUncertain,
         phase = DungeonFarm.phase,
         message = DungeonFarm.lastMessage
     }
@@ -5455,11 +6231,9 @@ if worldValue then
                         and DungeonFarm.enabled
                         and tostring(getPlayerValue("World", "")) == "Dungeon"
                         and not DungeonFarm.running then
-                        if DungeonFarm.ensureTeamApplied() then
-                            DungeonFarm.start()
-                        else
-                            DungeonFarm.updateStatus("Dungeon Farm: LOI", "Khong doi duoc team dungeon.")
-                        end
+                        -- Let the farm loop retry the team after the world and
+                        -- pet store finish loading instead of stopping here.
+                        DungeonFarm.start()
                     end
                 end)
             end
@@ -5919,6 +6693,48 @@ Feature.autoCollectDropsToggle = MainTab:Toggle({
     end
 })
 
+Feature.tpPetToggle = MainTab:Toggle({
+    Title = "TP Pet",
+    Desc = "Gia lap passive Lightspeed (Teleport): pet tele thang toi quai o xa thay vi bay tu tu. Ap dung cho pet duoc goi ra sau khi bat (doi team / vao dungeon de respawn pet dang o ngoai).",
+    Value = false,
+    Callback = function(value)
+        if Feature.tpPetToggleUpdating or Feature.restoringFeatureState then
+            return
+        end
+        Feature.tpPetEnabled = value == true
+        if not Feature.applyTpPet() then
+            Feature.tpPetEnabled = false
+            Feature.tpPetToggleUpdating = true
+            pcall(function()
+                Feature.tpPetToggle:Set(false)
+            end)
+            Feature.tpPetToggleUpdating = false
+            safeNotify(WindUI, "TP Pet", "Khong hook duoc HasPassive, da tat lai.")
+        elseif Feature.tpPetEnabled then
+            safeNotify(WindUI, "TP Pet", "Da bat: pet goi ra sau day se tele toi quai.")
+        end
+        Feature.updateMainStatus(true)
+        saveConfig(true)
+    end
+})
+
+Feature.attackWhileUltToggle = MainTab:Toggle({
+    Title = "Attack While Ult",
+    Desc = "Danh tay trong luc pet dung skill: tu Fire PetAttack cho pet dang ult (AbilityUseTime > 0) moi 1 giay de damage va thanh nang luong van tang.",
+    Value = false,
+    Callback = function(value)
+        if Feature.attackWhileUltToggleUpdating or Feature.restoringFeatureState then
+            return
+        end
+        Feature.attackWhileUltEnabled = value == true
+        if Feature.attackWhileUltEnabled then
+            safeNotify(WindUI, "Attack While Ult", "Da bat: pet van danh tay trong luc ult.")
+        end
+        Feature.updateMainStatus(true)
+        saveConfig(true)
+    end
+})
+
 MainTab:Button({
     Title = "Mo GUI Dupe Machine",
     Desc = "Mo cua so Dupe Machine bang luong GUI cua game.",
@@ -6268,7 +7084,16 @@ Feature.applySavedState = function()
     setToggleSilently(Feature.autoCollectDropsToggle, false, function(value)
         Feature.autoCollectDropsToggleUpdating = value
     end)
+    setToggleSilently(Feature.tpPetToggle, false, function(value)
+        Feature.tpPetToggleUpdating = value
+    end)
+    setToggleSilently(Feature.attackWhileUltToggle, false, function(value)
+        Feature.attackWhileUltToggleUpdating = value
+    end)
     Feature.autoCollectDropsEnabled = false
+    Feature.tpPetEnabled = false
+    Feature.applyTpPet()
+    Feature.attackWhileUltEnabled = false
     Feature.restoringFeatureState = false
 
     if desired.autoClone and selectedCount() > 0 then
@@ -6312,6 +7137,19 @@ Feature.applySavedState = function()
         Feature.autoCollectDropsEnabled = true
         setToggleSilently(Feature.autoCollectDropsToggle, true, function(value)
             Feature.autoCollectDropsToggleUpdating = value
+        end)
+    end
+    if desired.tpPet then
+        Feature.tpPetEnabled = true
+        setToggleSilently(Feature.tpPetToggle, true, function(value)
+            Feature.tpPetToggleUpdating = value
+        end)
+        Feature.applyTpPet()
+    end
+    if desired.attackWhileUlt then
+        Feature.attackWhileUltEnabled = true
+        setToggleSilently(Feature.attackWhileUltToggle, true, function(value)
+            Feature.attackWhileUltToggleUpdating = value
         end)
     end
     Feature.updateMainStatus(true)
