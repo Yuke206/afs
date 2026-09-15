@@ -481,6 +481,9 @@ local DungeonFarm = {
     greenRoomKeys = {},
     goldContentActive = false,
     goldRoomEmptySince = {},
+    roomEmptySince = {},
+    lastRouteWalkAt = 0,
+    lastRouteWalkTargetKey = nil,
     routeFolder = nil,
     mapGui = nil,
     mapPanel = nil,
@@ -499,6 +502,7 @@ local DungeonFarm = {
     teleportDistanceSlider = nil,
     flySpeedSlider = nil,
     startedAt = 0,
+    sessionDungeon = nil,
     lastMessage = "Chua chay."
 }
 
@@ -539,6 +543,7 @@ local scanPets
 local rebuildPetDropdowns
 local selectedCount
 local syncDungeonControls
+local refreshTeamOptions
 
 local function normalizeDungeonMapId(value)
     if type(value) ~= "string" or value == "" then
@@ -2946,8 +2951,11 @@ function Feature.getHealth(model)
 
     local healthValue = model and model:FindFirstChild("Health", true)
     local maxHealthValue = model and model:FindFirstChild("MaxHealth", true)
-    local health = healthValue and tonumber(healthValue.Value)
-    local maxHealth = maxHealthValue and tonumber(maxHealthValue.Value)
+    -- Enemy UI can also contain a Frame named Health; only read value-bearing objects.
+    local health = healthValue and (healthValue:IsA("NumberValue") or healthValue:IsA("IntValue"))
+        and tonumber(healthValue.Value)
+    local maxHealth = maxHealthValue and (maxHealthValue:IsA("NumberValue") or maxHealthValue:IsA("IntValue"))
+        and tonumber(maxHealthValue.Value)
     if health then
         return health, maxHealth or health
     end
@@ -4187,13 +4195,27 @@ end
 function DungeonFarm.findPrompt(dungeon)
     local rooms, startEntry, goldEntry = DungeonFarm.rebuildRoute(dungeon)
     if #DungeonFarm.route > 0 and startEntry and goldEntry then
-        -- Only use rooms on the shortest route to the selected gold room.
-        for _, entry in ipairs(DungeonFarm.route) do
+        -- Only activate the first incomplete room. Later route rooms stay
+        -- blocked until their red door has been opened from the prior room.
+        local firstIncomplete
+        for index, entry in ipairs(DungeonFarm.route) do
             if entry.room.Parent and not DungeonFarm.completed[entry.key] then
-                local prompt, part = DungeonFarm.getRoomConfirmPrompt(entry.room)
-                if prompt then
-                    return prompt, entry.room, part, entry.key
+                local previous = index > 1 and DungeonFarm.route[index - 1] or nil
+                if previous and DungeonFarm.completed[previous.key]
+                    and (DungeonFarm.findRouteDoor(dungeon, previous.room, entry.room)
+                        or DungeonFarm.roomHasPendingGoldDoor(previous.room)) then
+                    -- A live route door still blocks this ConfirmPart. Let the
+                    -- door phase interact first instead of flying through it.
+                    return nil
                 end
+                firstIncomplete = entry
+                break
+            end
+        end
+        if firstIncomplete then
+            local prompt, part = DungeonFarm.getRoomConfirmPrompt(firstIncomplete.room)
+            if prompt then
+                return prompt, firstIncomplete.room, part, firstIncomplete.key
             end
         end
     end
@@ -4244,6 +4266,65 @@ function DungeonFarm.findPrompt(dungeon)
         end
     end
     return bestPrompt, bestRoom, bestPart, bestKey
+end
+
+function DungeonFarm.revealNextRouteRoom(dungeon, token)
+    local now = os.clock()
+    if now - (DungeonFarm.lastRouteWalkAt or 0) < 4 then
+        return false
+    end
+
+    local _, startEntry = DungeonFarm.rebuildRoute(dungeon)
+    if not startEntry or #DungeonFarm.route < 2 then
+        return false
+    end
+
+    local firstIncomplete
+    local firstIncompleteIndex
+    for index, entry in ipairs(DungeonFarm.route) do
+        if entry.room.Parent and not DungeonFarm.completed[entry.key] then
+            firstIncomplete = entry
+            firstIncompleteIndex = index
+            break
+        end
+    end
+    if not firstIncomplete or firstIncomplete.room == startEntry.room then
+        return false
+    end
+
+    local walkEntry = firstIncomplete
+    if firstIncompleteIndex and firstIncompleteIndex > 1 then
+        local previous = DungeonFarm.route[firstIncompleteIndex - 1]
+        if previous and DungeonFarm.completed[previous.key] then
+            if DungeonFarm.findRouteDoor(dungeon, previous.room, firstIncomplete.room)
+                or DungeonFarm.roomHasPendingGoldDoor(previous.room) then
+                -- Never reveal a room by teleporting through an active door.
+                return false
+            end
+            walkEntry = previous
+        end
+    end
+
+    local character = LocalPlayer.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    local target = walkEntry.room:FindFirstChild("RootPart") or walkEntry.room
+    local center = DungeonFarm.getRoomCenter(walkEntry.room)
+    if not (target and center and (not root or (root.Position - center).Magnitude > 25)) then
+        return false
+    end
+
+    DungeonFarm.lastRouteWalkAt = now
+    DungeonFarm.lastRouteWalkTargetKey = walkEntry.key
+    DungeonFarm.phase = "route_walk"
+    DungeonFarm.updateStatus(
+        "Dungeon Farm: MO LOI ROUTE",
+        string.format("Dang bay toi room %s de mo route an toan...", tostring(walkEntry.room.Name))
+    )
+    local reached = DungeonFarm.flyTo(target, token)
+    if reached then
+        DungeonFarm.lastMessage = "Da mo loi route toi room " .. tostring(walkEntry.room.Name) .. "."
+    end
+    return reached
 end
 
 function DungeonFarm.getConfirmPartState(dungeon)
@@ -4947,31 +5028,44 @@ function DungeonFarm.getDoorInfo(prompt, map)
     }
 end
 
-function DungeonFarm.doorLeadsToGoldTarget(door, room, dungeon)
-    local target = DungeonFarm.routeTarget
-    if not (door and room and target and target.Parent) then
+function DungeonFarm.doorLeadsToRoom(door, room, target)
+    if not (door and room and target and room.Parent and target.Parent) or room == target then
         return false
     end
-    if room == target then
-        return true
-    end
 
-    -- Prefer the already-built shortest route, then verify the physical direction.
-    for index, entry in ipairs(DungeonFarm.route) do
-        if entry.room == room then
-            local nextEntry = DungeonFarm.route[index + 1]
-            if nextEntry and nextEntry.room == target then
-                return true
-            end
-        end
-    end
-
+    -- Prefer the native Door1..Door4 direction; position is a fallback for
+    -- clients where the physical door model has no directional name.
     local sourceX, sourceY = DungeonFarm.getMapCoordinate(room)
     local targetX, targetY = DungeonFarm.getMapCoordinate(target)
     local center = DungeonFarm.getRoomCenter(room)
     if not (sourceX and sourceY and targetX and targetY and center) then
         return false
     end
+
+    local directionIndex
+    local current = door
+    while current and current ~= room do
+        if current:IsA("Model") then
+            local direction = current.Name:match("^Door([1-4])$")
+            if direction then
+                directionIndex = tonumber(direction)
+                break
+            end
+        end
+        current = current.Parent
+    end
+
+    if directionIndex then
+        local offsets = {
+            {1, 0},
+            {0, 1},
+            {-1, 0},
+            {0, -1}
+        }
+        local offset = offsets[directionIndex]
+        return sourceX + offset[1] == targetX and sourceY + offset[2] == targetY
+    end
+
     local delta = door.Position - center
     local nextX, nextY
     if math.abs(delta.X) >= math.abs(delta.Z) then
@@ -4984,9 +5078,53 @@ function DungeonFarm.doorLeadsToGoldTarget(door, room, dungeon)
     return nextX == targetX and nextY == targetY
 end
 
+function DungeonFarm.doorLeadsToGoldTarget(door, room, dungeon)
+    local target = DungeonFarm.routeTarget
+    return target and DungeonFarm.doorLeadsToRoom(door, room, target) or false
+end
+
+function DungeonFarm.findRouteDoor(dungeon, sourceRoom, targetRoom)
+    local map = dungeon and dungeon:FindFirstChild("Map")
+    if not (map and sourceRoom and targetRoom) then
+        return nil
+    end
+    for _, object in ipairs(map:GetDescendants()) do
+        if object:IsA("ProximityPrompt") and object.Enabled then
+            local info = DungeonFarm.getDoorInfo(object, map)
+            if info and info.room == sourceRoom
+                and not DungeonFarm.goldDoorsOpened[info.key]
+                and DungeonFarm.doorLeadsToRoom(info.door, sourceRoom, targetRoom) then
+                return object, info
+            end
+        end
+    end
+    return nil
+end
+
 function DungeonFarm.findGoldDoor(dungeon)
     local map = dungeon and dungeon:FindFirstChild("Map")
     if not map then
+        return nil
+    end
+
+    -- Open the door from the last completed route room to the first incomplete
+    -- one. Selecting a door that points straight to the gold room skips red
+    -- doors in multi-room routes and sends the player to a locked ConfirmPart.
+    local sourceEntry, targetEntry
+    for index, entry in ipairs(DungeonFarm.route) do
+        if entry.room.Parent and not DungeonFarm.completed[entry.key] then
+            targetEntry = entry
+            sourceEntry = index > 1 and DungeonFarm.route[index - 1] or nil
+            break
+        end
+    end
+    if sourceEntry and targetEntry
+        and sourceEntry.room.Parent and targetEntry.room.Parent
+        and DungeonFarm.completed[sourceEntry.key] then
+        local object, info = DungeonFarm.findRouteDoor(dungeon, sourceEntry.room, targetEntry.room)
+        if object and info then
+            return object, info.door, info.room, info.key, info.roomKey
+        end
         return nil
     end
 
@@ -5026,7 +5164,7 @@ function DungeonFarm.roomHasPendingGoldDoor(room)
     return false
 end
 
-function DungeonFarm.getChestTargets(dungeon)
+function DungeonFarm.getChestTargets(dungeon, focusRoom)
     local map = dungeon and dungeon:FindFirstChild("Map")
     if not map then
         return {}
@@ -5046,9 +5184,10 @@ function DungeonFarm.getChestTargets(dungeon)
             return
         end
         local room = DungeonFarm.findRoom(target, map)
+        local isFocusRoom = focusRoom and room == focusRoom
         if not room
-            or not DungeonFarm.completed[room:GetFullName()]
-            or DungeonFarm.roomHasPendingGoldDoor(room) then
+            or (not isFocusRoom and not DungeonFarm.completed[room:GetFullName()])
+            or (not isFocusRoom and DungeonFarm.roomHasPendingGoldDoor(room)) then
             return
         end
         local key = target:GetFullName()
@@ -5068,6 +5207,36 @@ function DungeonFarm.getChestTargets(dungeon)
         end
     end
     return targets
+end
+
+function DungeonFarm.canMarkRoomClearedSequential(dungeon, room)
+    if not (dungeon and room and room.Parent) then
+        return false
+    end
+
+    local key = room:GetFullName()
+    if DungeonFarm.goldRoomKeys[key] and not DungeonFarm.goldRoomsOpened[key] then
+        DungeonFarm.roomEmptySince[key] = nil
+        return false
+    end
+    if DungeonFarm.getRoomConfirmPrompt(room) then
+        DungeonFarm.roomEmptySince[key] = nil
+        return false
+    end
+
+    local liveEnemies, uncertain = DungeonFarm.getLiveEnemies(dungeon, room)
+    local chestTargets = DungeonFarm.getChestTargets(dungeon, room)
+    if #liveEnemies > 0 or uncertain or DungeonFarm.roomHasChestObject(room) or #chestTargets > 0 then
+        DungeonFarm.roomEmptySince[key] = nil
+        return false
+    end
+
+    -- Gold content and chests can appear a few ticks after the last enemy dies.
+    local now = os.clock()
+    local emptySince = DungeonFarm.roomEmptySince[key] or now
+    DungeonFarm.roomEmptySince[key] = emptySince
+    local settleTime = DungeonFarm.goldRoomKeys[key] and 4 or 1.5
+    return now - emptySince >= settleTime
 end
 
 function DungeonFarm.isGoldRunComplete(dungeon)
@@ -5149,11 +5318,15 @@ function DungeonFarm.reconcileCurrentGoldRoom(dungeon)
         return false
     end
 
-    local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+    local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, target)
     local hasConfirm = DungeonFarm.getRoomConfirmPrompt(target) ~= nil
     local hasDoor = DungeonFarm.roomHasPendingGoldDoor(target)
     local hasChest = DungeonFarm.roomHasChestObject(target)
     local key = target:GetFullName()
+    if not DungeonFarm.goldRoomsOpened[key] then
+        DungeonFarm.goldRoomEmptySince[key] = nil
+        return false
+    end
     if #liveEnemies > 0 or uncertainEnemies or hasConfirm or hasDoor or hasChest then
         DungeonFarm.goldRoomEmptySince[key] = nil
         return false
@@ -5345,6 +5518,20 @@ function DungeonFarm.isLiveEnemy(enemy, enemies, _forceProbe)
         return false, false
     end
 
+    -- Attackable can briefly exist before the model has the target parts that
+    -- SendPet requires. Do not count an un-targetable model as a live enemy
+    -- forever, otherwise one stale spawn leaves the room at "Con 1 enemy".
+    local targetRoot = enemy.PrimaryPart
+        or enemy:FindFirstChild("HumanoidRootPart", true)
+        or enemy:FindFirstChild("RootPart", true)
+    local targetReady = targetRoot ~= nil and enemy:FindFirstChild("Attackers") ~= nil
+    if not targetReady then
+        if now - DungeonFarm.enemySeenAt[enemy] < 4 then
+            return false, true
+        end
+        return false, false
+    end
+
     if attackable then
         return true, false
     end
@@ -5357,7 +5544,31 @@ function DungeonFarm.isLiveEnemy(enemy, enemies, _forceProbe)
     return false, false
 end
 
-function DungeonFarm.getLiveEnemies(dungeon)
+function DungeonFarm.enemyBelongsToRoom(enemy, room)
+    if not room then
+        return true
+    end
+
+    local enemyPosition = DungeonFarm.getTargetPosition(enemy)
+    if not enemyPosition then
+        return true
+    end
+
+    local ok, boxCFrame, boxSize = pcall(function()
+        return room:GetBoundingBox()
+    end)
+    if ok and boxCFrame and boxSize then
+        local localPosition = boxCFrame:PointToObjectSpace(enemyPosition)
+        return math.abs(localPosition.X) <= boxSize.X / 2 + 16
+            and math.abs(localPosition.Z) <= boxSize.Z / 2 + 16
+            and math.abs(localPosition.Y) <= boxSize.Y / 2 + 30
+    end
+
+    local center = DungeonFarm.getRoomCenter(room)
+    return not center or (enemyPosition - center).Magnitude <= 55
+end
+
+function DungeonFarm.getLiveEnemies(dungeon, room)
     local enemies = dungeon and dungeon:FindFirstChild("Enemies")
     local result = {}
     local uncertain = false
@@ -5366,9 +5577,9 @@ function DungeonFarm.getLiveEnemies(dungeon)
     end
     for _, enemy in ipairs(enemies:GetChildren()) do
         local live, unknown = DungeonFarm.isLiveEnemy(enemy, enemies)
-        if live then
+        if live and DungeonFarm.enemyBelongsToRoom(enemy, room) then
             table.insert(result, enemy)
-        elseif unknown then
+        elseif unknown and DungeonFarm.enemyBelongsToRoom(enemy, room) then
             uncertain = true
         end
     end
@@ -5378,7 +5589,7 @@ function DungeonFarm.getLiveEnemies(dungeon)
     return result, uncertain
 end
 
-function DungeonFarm.clearEnemies(dungeon, token)
+function DungeonFarm.clearEnemies(dungeon, token, room)
     local enemies = dungeon and dungeon:FindFirstChild("Enemies")
     local sendEvent = Bindable:FindFirstChild("SendPet")
     if not enemies then
@@ -5433,7 +5644,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
             return false, "Combat qua lau, het thoi gian cho room."
         end
 
-        local enemyList, uncertain = DungeonFarm.getLiveEnemies(dungeon)
+        local enemyList, uncertain = DungeonFarm.getLiveEnemies(dungeon, room)
         if #enemyList == 0 then
             if uncertain then
                 task.wait(0.25)
@@ -5531,7 +5742,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
             end
 
             targetLive, targetUnknown = DungeonFarm.isLiveEnemy(enemy, enemies, true)
-            local remaining = #DungeonFarm.getLiveEnemies(dungeon)
+            local remaining = #DungeonFarm.getLiveEnemies(dungeon, room)
             DungeonFarm.lastEnemyCount = remaining
             DungeonFarm.updateStatus(
                 "Dungeon Farm: COMBAT",
@@ -5549,7 +5760,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
             -- Exclude the dead model immediately so the next pass picks a fresh target.
             DungeonFarm.deadEnemies[enemy] = true
         end
-        local refreshedEnemies, refreshedUncertain = DungeonFarm.getLiveEnemies(dungeon)
+        local refreshedEnemies, refreshedUncertain = DungeonFarm.getLiveEnemies(dungeon, room)
         DungeonFarm.lastEnemyCount = #refreshedEnemies
         DungeonFarm.updateStatus(
             "Dungeon Farm: COMBAT",
@@ -5574,7 +5785,7 @@ function DungeonFarm.clearEnemies(dungeon, token)
     return false, "Folder Enemies da bi dong khi dang combat."
 end
 
-function DungeonFarm.clearChests(dungeon, token)
+function DungeonFarm.clearChests(dungeon, token, focusRoom)
     local sendEvent = Bindable:FindFirstChild("SendPet")
     if not sendEvent then
         return false, "Bindable.SendPet khong ton tai."
@@ -5593,7 +5804,7 @@ function DungeonFarm.clearChests(dungeon, token)
             return false, "Farm chest qua lau, het thoi gian cho chest."
         end
 
-        local chests = DungeonFarm.getChestTargets(dungeon)
+        local chests = DungeonFarm.getChestTargets(dungeon, focusRoom)
         if #chests == 0 then
             DungeonFarm.lastEnemyCount = 0
             return true, "Da clear chest."
@@ -5743,46 +5954,58 @@ function DungeonFarm.start()
         return
     end
 
+    local activeDungeon = DungeonFarm.getDungeon()
+    local preserveProgress = DungeonFarm.sessionDungeon ~= nil
+        and (activeDungeon == nil or DungeonFarm.sessionDungeon == activeDungeon)
+
     DungeonFarm.token = DungeonFarm.token + 1
     local token = DungeonFarm.token
     DungeonFarm.running = true
     DungeonFarm.phase = "searching"
-    DungeonFarm.room = nil
-    DungeonFarm.targetRoom = nil
-    DungeonFarm.targetPart = nil
-    DungeonFarm.activationAt = 0
-    DungeonFarm.lastEnemyCount = 0
-    DungeonFarm.completed = {}
-    DungeonFarm.attempts = {}
-    DungeonFarm.goldRooms = {}
-    DungeonFarm.goldDoorsOpened = {}
-    DungeonFarm.goldRoomsOpened = {}
-    DungeonFarm.completedChests = {}
-    DungeonFarm.enemySeenAt = {}
-    DungeonFarm.lastCombatTarget = nil
-    DungeonFarm.lastCombatSendAt = 0
-    DungeonFarm.combatSendCount = 0
-    DungeonFarm.lastCombatError = ""
-    DungeonFarm.lastLiveScanAt = 0
-    DungeonFarm.lastLiveScanCount = 0
-    DungeonFarm.lastLiveScanUncertain = false
-    DungeonFarm.deadEnemies = {}
-    DungeonFarm.route = {}
-    DungeonFarm.routeKey = ""
-    DungeonFarm.routeTarget = nil
-    DungeonFarm.goldTargetKey = nil
-    DungeonFarm.goldTargetRoom = nil
-    DungeonFarm.goldRoomKeys = {}
-    DungeonFarm.goldContentActive = false
-    DungeonFarm.goldRoomEmptySince = {}
-    DungeonFarm.greenWaitSince = nil
-    DungeonFarm.lastEquippedPetCount = DungeonFarm.getEquippedPetCount()
-    DungeonFarm.teamApplied = false
-    DungeonFarm.teamApplying = false
-    DungeonFarm.teamIndexApplied = nil
-    DungeonFarm.teamAppliedAt = 0
-    DungeonFarm.startedAt = os.clock()
-    DungeonFarm.lastMessage = "Dang tim ConfirmPart active."
+    if not preserveProgress then
+        DungeonFarm.room = nil
+        DungeonFarm.targetRoom = nil
+        DungeonFarm.targetPart = nil
+        DungeonFarm.activationAt = 0
+        DungeonFarm.lastEnemyCount = 0
+        DungeonFarm.completed = {}
+        DungeonFarm.attempts = {}
+        DungeonFarm.goldRooms = {}
+        DungeonFarm.goldDoorsOpened = {}
+        DungeonFarm.goldRoomsOpened = {}
+        DungeonFarm.completedChests = {}
+        DungeonFarm.enemySeenAt = {}
+        DungeonFarm.lastCombatTarget = nil
+        DungeonFarm.lastCombatSendAt = 0
+        DungeonFarm.combatSendCount = 0
+        DungeonFarm.lastCombatError = ""
+        DungeonFarm.lastLiveScanAt = 0
+        DungeonFarm.lastLiveScanCount = 0
+        DungeonFarm.lastLiveScanUncertain = false
+        DungeonFarm.deadEnemies = {}
+        DungeonFarm.route = {}
+        DungeonFarm.routeKey = ""
+        DungeonFarm.routeTarget = nil
+        DungeonFarm.goldTargetKey = nil
+        DungeonFarm.goldTargetRoom = nil
+        DungeonFarm.goldRoomKeys = {}
+        DungeonFarm.goldContentActive = false
+        DungeonFarm.goldRoomEmptySince = {}
+        DungeonFarm.roomEmptySince = {}
+        DungeonFarm.lastRouteWalkAt = 0
+        DungeonFarm.lastRouteWalkTargetKey = nil
+        DungeonFarm.greenWaitSince = nil
+        DungeonFarm.lastEquippedPetCount = DungeonFarm.getEquippedPetCount()
+        DungeonFarm.teamApplied = false
+        DungeonFarm.teamApplying = false
+        DungeonFarm.teamIndexApplied = nil
+        DungeonFarm.teamAppliedAt = 0
+        DungeonFarm.startedAt = os.clock()
+        DungeonFarm.lastMessage = "Dang tim ConfirmPart active."
+    end
+    if activeDungeon then
+        DungeonFarm.sessionDungeon = activeDungeon
+    end
 
     local entryTeamReady = false
     task.spawn(function()
@@ -5800,6 +6023,9 @@ function DungeonFarm.start()
                 DungeonFarm.updateStatus("Dungeon Farm: CHO", "Dang cho map Dungeon load...")
                 task.wait(0.5)
             else
+                if DungeonFarm.sessionDungeon == nil then
+                    DungeonFarm.sessionDungeon = dungeon
+                end
                 if not entryTeamReady then
                     local entryTeamIndex, entryTeamRole = DungeonFarm.getRoomTeamIndex(DungeonFarm.targetRoom)
                     DungeonFarm.phase = "team_retry"
@@ -5841,7 +6067,14 @@ function DungeonFarm.start()
                     continue
                 end
                 local enemies = dungeon:FindFirstChild("Enemies")
-                local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+                local focusRoom = DungeonFarm.targetRoom and DungeonFarm.targetRoom.Parent
+                    and DungeonFarm.targetRoom or nil
+                local liveEnemies, uncertainEnemies
+                if focusRoom then
+                    liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, focusRoom)
+                else
+                    liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+                end
                 if #liveEnemies > 0 or uncertainEnemies then
                     local _, currentEntry = DungeonFarm.rebuildRoute(dungeon)
                     local combatRoom = DungeonFarm.targetRoom or (currentEntry and currentEntry.room)
@@ -5861,21 +6094,28 @@ function DungeonFarm.start()
                         continue
                     end
                     DungeonFarm.phase = "combat"
-                    local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
+                    local ok, reason = DungeonFarm.clearEnemies(dungeon, token, combatRoom)
                     if not ok then
                         DungeonFarm.fail(reason, token)
                         return
                     end
-                    DungeonFarm.markRoomCleared(combatRoom)
-                    -- The global enemy list carries no room tag, so a stale
-                    -- targetRoom could mark the wrong room and hide the gold
-                    -- door behind a room that never completes. Mark the room
-                    -- the player is actually standing in as well.
-                    if currentEntry and currentEntry.room and currentEntry.room ~= combatRoom then
-                        DungeonFarm.markRoomCleared(currentEntry.room)
+                    local chestOK, chestReason = DungeonFarm.clearChests(dungeon, token, combatRoom)
+                    if not chestOK then
+                        DungeonFarm.fail(chestReason, token)
+                        return
+                    end
+                    if DungeonFarm.canMarkRoomClearedSequential(dungeon, combatRoom) then
+                        DungeonFarm.markRoomCleared(combatRoom)
+                    else
+                        DungeonFarm.phase = "waiting_room"
+                        DungeonFarm.lastMessage = "Room " .. tostring(combatRoom.Name)
+                            .. " dang cho chest/du lieu on dinh."
+                        DungeonFarm.updateStatus("Dungeon Farm: CHO ROOM", DungeonFarm.lastMessage)
+                        task.wait(0.35)
+                        continue
                     end
                 else
-                    local chests = DungeonFarm.getChestTargets(dungeon)
+                    local chests = DungeonFarm.getChestTargets(dungeon, focusRoom)
                     if #chests > 0 then
                         local map = dungeon:FindFirstChild("Map")
                         local chestRoom = map and DungeonFarm.findRoom(chests[1], map) or nil
@@ -5906,13 +6146,15 @@ function DungeonFarm.start()
                             continue
                         end
                         DungeonFarm.phase = "chest"
-                        local ok, reason = DungeonFarm.clearChests(dungeon, token)
+                        local ok, reason = DungeonFarm.clearChests(dungeon, token, chestRoom)
                         if not ok then
                             DungeonFarm.fail(reason, token)
                             return
                         end
                         for room in pairs(chestRooms) do
-                            DungeonFarm.markRoomCleared(room)
+                            if DungeonFarm.canMarkRoomClearedSequential(dungeon, room) then
+                                DungeonFarm.markRoomCleared(room)
+                            end
                         end
                     else
                         if DungeonFarm.isGoldRunComplete(dungeon) then
@@ -5967,8 +6209,29 @@ function DungeonFarm.start()
                             end
                             task.wait(0.5)
                         else
+                            local pendingRoom = DungeonFarm.targetRoom
+                            if pendingRoom and pendingRoom.Parent
+                                and not DungeonFarm.completed[pendingRoom:GetFullName()]
+                                and not DungeonFarm.getRoomConfirmPrompt(pendingRoom) then
+                                if DungeonFarm.canMarkRoomClearedSequential(dungeon, pendingRoom) then
+                                    DungeonFarm.markRoomCleared(pendingRoom)
+                                    DungeonFarm.roomEmptySince[pendingRoom:GetFullName()] = nil
+                                    task.wait(0.1)
+                                    continue
+                                end
+                                DungeonFarm.phase = "waiting_room"
+                                DungeonFarm.lastMessage = "Dang cho room " .. tostring(pendingRoom.Name)
+                                    .. " spawn du enemy/chest truoc khi di tiep."
+                                DungeonFarm.updateStatus("Dungeon Farm: CHO ROOM", DungeonFarm.lastMessage)
+                                task.wait(0.5)
+                                continue
+                            end
                             local prompt, room, part, key = DungeonFarm.findPrompt(dungeon)
                             if not prompt then
+                                if DungeonFarm.revealNextRouteRoom(dungeon, token) then
+                                    task.wait(0.35)
+                                    continue
+                                end
                                 local totalConfirmParts, pendingConfirmParts, enabledConfirmParts =
                                     DungeonFarm.getConfirmPartState(dungeon)
                                 if totalConfirmParts == 0 then
@@ -6092,14 +6355,29 @@ function DungeonFarm.start()
                                 local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
                                 if #liveEnemies > 0 or uncertainEnemies then
                                     DungeonFarm.phase = "combat"
-                                    local ok, reason = DungeonFarm.clearEnemies(dungeon, token)
+                                    local ok, reason = DungeonFarm.clearEnemies(dungeon, token, room)
                                     if not ok then
                                         DungeonFarm.fail(reason, token)
                                         return
                                     end
                                 end
 
+                                local chestOK, chestReason = DungeonFarm.clearChests(dungeon, token, room)
+                                if not chestOK then
+                                    DungeonFarm.fail(chestReason, token)
+                                    return
+                                end
+                                if not DungeonFarm.canMarkRoomClearedSequential(dungeon, room) then
+                                    DungeonFarm.phase = "waiting_room"
+                                    DungeonFarm.lastMessage = "Room " .. tostring(room.Name)
+                                        .. " dang cho chest/du lieu on dinh."
+                                    DungeonFarm.updateStatus("Dungeon Farm: CHO ROOM", DungeonFarm.lastMessage)
+                                    task.wait(0.35)
+                                    continue
+                                end
+
                                 DungeonFarm.markRoomCleared(room, key)
+                                DungeonFarm.roomEmptySince[key] = nil
                                 DungeonFarm.attempts[key] = nil
                                 DungeonFarm.lastMessage = "Da clear room " .. tostring(room.Name) .. "."
                                 DungeonFarm.phase = "waiting"
@@ -6129,6 +6407,7 @@ local function restoreDungeonSession(reason)
     DungeonFarm.token = DungeonFarm.token + 1
     DungeonFarm.running = false
     DungeonFarm.entered = false
+    DungeonFarm.sessionDungeon = nil
     DungeonFarm.phase = "idle"
     DungeonFarm.room = nil
     DungeonFarm.targetRoom = nil
@@ -6158,6 +6437,9 @@ local function restoreDungeonSession(reason)
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
     DungeonFarm.goldRoomEmptySince = {}
+    DungeonFarm.roomEmptySince = {}
+    DungeonFarm.lastRouteWalkAt = 0
+    DungeonFarm.lastRouteWalkTargetKey = nil
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
     DungeonFarm.teamIndexApplied = nil
@@ -7072,6 +7354,7 @@ local function startAutoDungeon()
     DungeonFarm.token = DungeonFarm.token + 1
     DungeonFarm.running = false
     DungeonFarm.entered = false
+    DungeonFarm.sessionDungeon = nil
     DungeonFarm.phase = "starting"
     DungeonFarm.room = nil
     DungeonFarm.targetRoom = nil
@@ -7092,6 +7375,9 @@ local function startAutoDungeon()
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
     DungeonFarm.goldRoomEmptySince = {}
+    DungeonFarm.roomEmptySince = {}
+    DungeonFarm.lastRouteWalkAt = 0
+    DungeonFarm.lastRouteWalkTargetKey = nil
     DungeonFarm.teamApplied = false
     DungeonFarm.teamApplying = false
     DungeonFarm.teamIndexApplied = nil
@@ -7326,6 +7612,7 @@ dungeonFinishConnection = globalEnv.__afs_trackConnection(DungeonFinish.OnClient
                     DungeonFarm.running = false
                     DungeonFarm.entered = false
                     dungeonActive = false
+                    DungeonFarm.sessionDungeon = nil
                     DungeonFarm.teamApplied = false
                     DungeonFarm.teamApplying = false
                     DungeonFarm.teamIndexApplied = nil
@@ -7375,6 +7662,7 @@ if worldValue then
                         DungeonFarm.running = false
                         DungeonFarm.entered = false
                         dungeonActive = false
+                        DungeonFarm.sessionDungeon = nil
                         DungeonFarm.teamApplied = false
                         DungeonFarm.teamApplying = false
                         DungeonFarm.teamIndexApplied = nil
@@ -8131,6 +8419,18 @@ SettingsTab:Button({
 })
 
 SettingsTab:Button({
+    Title = "Refresh team",
+    Desc = "Quet lai danh sach PetTeams va cap nhat dropdown team.",
+    Callback = function()
+        protectedCall("Refresh teams", function()
+            if refreshTeamOptions then
+                refreshTeamOptions()
+            end
+        end)
+    end
+})
+
+SettingsTab:Button({
     Title = utf8Text("Mo Artefact tu xa", 77, 7903, 32, 65, 114, 116, 101, 102, 97, 99, 116, 32, 116, 7915, 32, 120, 97),
     Desc = utf8Text("Mo bang Artefact ma khong can di chuyen", 77, 7903, 32, 98, 7843, 110, 103, 32, 65, 114, 116, 101, 102, 97, 99, 116, 32, 109, 224, 32, 107, 104, 244, 110, 103, 32, 99, 7847, 110, 32, 100, 105, 32, 99, 104, 117, 121, 7875, 110),
     Callback = function()
@@ -8256,6 +8556,60 @@ local function selectMapped(dropdown, mapping, wanted)
             return
         end
     end
+end
+
+refreshTeamOptions = function()
+    local teams = getStoreTable("PetTeams", true)
+    dungeonTeamByOption = {}
+    local options = makeDungeonTeamOptions()
+    local teamCount = #teams
+
+    local function clampTeamIndex(value, fallback)
+        if teamCount < 1 then
+            return 1
+        end
+        return math.clamp(math.floor(tonumber(value) or fallback or 1), 1, teamCount)
+    end
+
+    dungeonSelection.normalTeamIndex = clampTeamIndex(
+        dungeonSelection.normalTeamIndex or dungeonSelection.teamIndex,
+        1
+    )
+    dungeonSelection.goldTeamIndex = clampTeamIndex(
+        dungeonSelection.goldTeamIndex or dungeonSelection.normalTeamIndex,
+        dungeonSelection.normalTeamIndex
+    )
+    dungeonSelection.teamIndex = dungeonSelection.normalTeamIndex
+
+    local gateFarm = Feature.gateFarm
+    gateFarm.teamIndex = clampTeamIndex(gateFarm.teamIndex, dungeonSelection.normalTeamIndex)
+
+    local refreshed = 0
+    for _, dropdown in pairs({
+        dungeonNormalTeamDropdown,
+        dungeonGoldTeamDropdown,
+        gateFarm.teamDropdown
+    }) do
+        if dropdown then
+            local ok = pcall(function()
+                dropdown:Refresh(options)
+            end)
+            if ok then
+                refreshed = refreshed + 1
+            end
+        end
+    end
+
+    beginDropdownSync()
+    if syncDungeonControls then
+        syncDungeonControls()
+    end
+    selectMapped(gateFarm.teamDropdown, dungeonTeamByOption, gateFarm.teamIndex)
+    saveConfig(true)
+    notifyStatus(
+        "Teams",
+        string.format("Da quet %d team; cap nhat %d dropdown.", teamCount, refreshed)
+    )
 end
 
 function AutoPassive.selectMappedMulti(dropdown, mapping, wanted)
