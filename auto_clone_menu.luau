@@ -629,6 +629,7 @@ end
 local function getMachines()
     local seen = {}
     local result = {}
+    local worlds = workspace:FindFirstChild("Worlds")
 
     for _, machine in ipairs(getTaggedMachines()) do
         local ok, id = pcall(function()
@@ -640,14 +641,25 @@ local function getMachines()
                 seen[id] = true
                 local path = id
                 local world = ""
+                local worldPath = ""
                 pcall(function()
                     path = machine:GetFullName()
-                    world = machine.Parent and machine.Parent.Name or ""
+                    local worldInstance = machine
+                    while worldInstance and worldInstance.Parent and worldInstance.Parent ~= worlds do
+                        worldInstance = worldInstance.Parent
+                    end
+                    if worldInstance and worldInstance.Parent == worlds then
+                        world = worldInstance.Name
+                        worldPath = worldInstance:GetFullName()
+                    else
+                        world = machine.Parent and machine.Parent.Name or ""
+                    end
                 end)
                 table.insert(result, {
                     id = id,
                     path = path,
                     world = world,
+                    worldPath = worldPath,
                     instance = machine
                 })
             end
@@ -2645,20 +2657,6 @@ local function canAct(machineId, action)
     return true
 end
 
-local function setLocalClone(machineId, uid, duration)
-    local data = getStoreTable("CloneMachineData")
-    data[machineId] = {
-        UID = uid,
-        FinishTime = math.floor(getGameTime() + duration)
-    }
-    setStoreValue("CloneMachineData", data, 3)
-
-    local items = getStoreTable("Items")
-    local tokens = (tonumber(items.CloneToken or 0) or 0) - 1
-    items.CloneToken = tokens > 0 and tokens or nil
-    setStoreValue("Items", items, 1)
-end
-
 local function setLocalWithdraw(machineId)
     local data = getStoreTable("CloneMachineData")
     data[machineId] = nil
@@ -2839,6 +2837,8 @@ function Feature.fallenStarIsCandidate(instance)
     pcall(function()
         taggedEgg = CollectionService:HasTag(instance, "EggPurchase")
     end)
+    -- Ignore decorative Map.Assets.Star models. A farmable star is exposed as
+    -- an attackable enemy (or carries equivalent target evidence).
     if taggedEgg or not Feature.fallenStarHasTargetEvidence(instance) then
         return false
     end
@@ -2873,7 +2873,7 @@ function Feature.fallenStarPostChat(message)
 end
 
 function Feature.fallenStarFarm.scan(force)
-    if not Feature.fallenStarFarm.enabled then
+    if not Feature.fallenStarFarm.enabled and not force then
         return {}
     end
     local now = os.clock()
@@ -2881,7 +2881,39 @@ function Feature.fallenStarFarm.scan(force)
         return nil
     end
     Feature.fallenStarFarm.nextScanAt = now + math.max(0.5, tonumber(Feature.fallenStarFarm.interval) or 1)
-    local active = Feature.fallenStarGetMeteorShowerValue()
+    local worlds = workspace:FindFirstChild("Worlds")
+    local candidates = {}
+    if worlds then
+        for _, world in ipairs(worlds:GetChildren()) do
+            for _, folderName in ipairs({"Enemies", "NewEnemies"}) do
+                local folder = world:FindFirstChild(folderName)
+                if folder then
+                    for _, instance in ipairs(folder:GetDescendants()) do
+                        if Feature.fallenStarIsCandidate(instance) then
+                            local position = Feature.fallenStarGetInstancePosition(instance)
+                            if position then
+                                local record = {instance = instance, world = world, position = position}
+                                table.insert(candidates, record)
+                                if not Feature.fallenStarFarm.seen[instance] then
+                                    Feature.fallenStarFarm.seen[instance] = true
+                                    Feature.fallenStarPostChat(string.format(
+                                        "Fallen Star spawn tai map %s | X:%d Y:%d Z:%d",
+                                        world.Name,
+                                        math.floor(position.X + 0.5),
+                                        math.floor(position.Y + 0.5),
+                                        math.floor(position.Z + 0.5)
+                                    ))
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- The multiplier can lag behind the replicated enemy object. Treat a live
+    -- attackable FallenStar as authoritative so the farm does not miss it.
+    local active = Feature.fallenStarGetMeteorShowerValue() or #candidates > 0
     Feature.fallenStarFarm.lastEventActive = active
     if not active then
         Feature.fallenStarFarm.target = nil
@@ -2889,32 +2921,6 @@ function Feature.fallenStarFarm.scan(force)
         Feature.fallenStarFarm.lastScanCount = 0
         Feature.fallenStarFarm.lastMessage = "Dang cho Star Shower."
         return {}
-    end
-
-    local worlds = workspace:FindFirstChild("Worlds")
-    local candidates = {}
-    if worlds then
-        for _, world in ipairs(worlds:GetChildren()) do
-            for _, instance in ipairs(world:GetDescendants()) do
-                if Feature.fallenStarIsCandidate(instance) then
-                    local position = Feature.fallenStarGetInstancePosition(instance)
-                    if position then
-                        local record = {instance = instance, world = world, position = position}
-                        table.insert(candidates, record)
-                        if not Feature.fallenStarFarm.seen[instance] then
-                            Feature.fallenStarFarm.seen[instance] = true
-                            Feature.fallenStarPostChat(string.format(
-                                "Fallen Star spawn tai map %s | X:%d Y:%d Z:%d",
-                                world.Name,
-                                math.floor(position.X + 0.5),
-                                math.floor(position.Y + 0.5),
-                                math.floor(position.Z + 0.5)
-                            ))
-                        end
-                    end
-                end
-            end
-        end
     end
     Feature.fallenStarFarm.lastScanCount = #candidates
     local character = LocalPlayer.Character
@@ -3015,7 +3021,9 @@ function Feature.fallenStarFarm.updateStatus()
 end
 
 function Feature.fallenStarFarm.step()
-    if not Feature.fallenStarFarm.enabled or dungeonActive or tostring(getPlayerValue("World", "")) == "Dungeon" then
+    local worldName = tostring(getPlayerValue("World", ""))
+    local dungeonBusy = worldName == "Dungeon" or DungeonFarm.running or DungeonFarm.entered
+    if not Feature.fallenStarFarm.enabled or dungeonBusy then
         return
     end
     local candidates = Feature.fallenStarFarm.scan(false)
@@ -3045,7 +3053,7 @@ function Feature.fallenStarFarm.step()
         Feature.fallenStarFarm.updateStatus()
         return
     end
-    local position = getInstancePosition(target)
+    local position = Feature.fallenStarGetInstancePosition(target)
     if not position then
         Feature.fallenStarFarm.target = nil
         Feature.fallenStarFarm.updateStatus()
@@ -3077,16 +3085,64 @@ function Feature.fallenStarFarm.stop()
     Feature.fallenStarFarm.seen = setmetatable({}, {__mode = "k"})
     Feature.fallenStarFarm.updateStatus()
 end
-local function findTaggedMachine(machineId)
-    for _, machine in ipairs(getTaggedMachines()) do
+local function findTaggedMachine(machineId, worldName, preferredPath)
+    local worlds = workspace:FindFirstChild("Worlds")
+    local worldRoot = worlds and worlds:FindFirstChild(tostring(worldName or ""))
+    if not worldRoot then
+        return nil
+    end
+
+    local candidates = {worldRoot}
+    for _, descendant in ipairs(worldRoot:GetDescendants()) do
+        table.insert(candidates, descendant)
+    end
+
+    local function matches(machine, requirePath)
         local ok, id = pcall(function()
             return machine:GetAttribute("CloneMachineId")
         end)
-        if ok and tostring(id) == tostring(machineId) then
+        if not ok or tostring(id) ~= tostring(machineId) then
+            return false
+        end
+        if requirePath then
+            local pathOk, path = pcall(function()
+                return machine:GetFullName()
+            end)
+            return pathOk and path == preferredPath
+        end
+        return true
+    end
+
+    if preferredPath and preferredPath ~= "" then
+        for _, machine in ipairs(candidates) do
+            if matches(machine, true) then
+                return machine
+            end
+        end
+    end
+    for _, machine in ipairs(candidates) do
+        if matches(machine, false) then
             return machine
         end
     end
     return nil
+end
+
+local function placeCharacterNearMachine(model, pivot)
+    local character = LocalPlayer.Character
+    if not character or not pivot then
+        return false
+    end
+    local destination = CFrame.new(pivot.Position + Vector3.new(0, 4, 0))
+    local ok = pcall(function()
+        character:PivotTo(destination)
+        local root = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+        if root then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+    return ok
 end
 
 local function moveToMachine(machine)
@@ -3094,46 +3150,83 @@ local function moveToMachine(machine)
         return false
     end
 
-    local model = findTaggedMachine(machine.id) or machine.instance
+    local model
+    local modelDeadline = os.clock() + 5
+    while alive() and os.clock() < modelDeadline do
+        model = findTaggedMachine(machine.id, machine.world, machine.path)
+        if model then
+            break
+        end
+        task.wait(0.15)
+    end
     if not model then
         return false
     end
 
-    local character = LocalPlayer.Character
-    if not character then
+    local pivotOk, pivot = pcall(function()
+        return model:GetPivot()
+    end)
+    if not pivotOk or not pivot then
         return false
     end
 
-    local ok, pivot = pcall(function()
-        return model:GetPivot()
-    end)
-    if not ok or not pivot then
-        return false
-    end
-    local dest = CFrame.new(pivot.Position + Vector3.new(0, 4, 0))
-    pcall(function()
-        character:PivotTo(dest)
-    end)
-    -- Cho server nhan vi tri moi truoc khi Fire: server tu choi nap pet tu
-    -- xa (0.35s cu khong du de replicate, nhat la khi doi world). Poll toi
-    -- khi dung gan may (<=25), toi da 3 giay; giu chan neu bi keo ve.
-    local deadline = os.clock() + 3
+    -- Re-apply the exact target until the server has had several consecutive
+    -- frames to observe the player inside the interaction radius.
+    local deadline = os.clock() + 5
+    local stableSamples = 0
     while os.clock() < deadline do
-        local char = LocalPlayer.Character
-        local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+        if tostring(getPlayerValue("World", "")) ~= tostring(machine.world) then
+            stableSamples = 0
+            task.wait(0.15)
+            continue
+        end
+        local currentModel = findTaggedMachine(machine.id, machine.world, machine.path)
+        if not currentModel then
+            stableSamples = 0
+            task.wait(0.15)
+            continue
+        end
+        local currentPivotOk, currentPivot = pcall(function()
+            return currentModel:GetPivot()
+        end)
+        if not currentPivotOk or not currentPivot then
+            stableSamples = 0
+            task.wait(0.15)
+            continue
+        end
+        local root = LocalPlayer.Character
+            and (LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or LocalPlayer.Character.PrimaryPart)
         local pos = nil
         pcall(function()
             pos = root and root.Position or nil
         end)
-        if pos and (pos - pivot.Position).Magnitude <= 25 then
-            return true
+        local distance = pos and (pos - currentPivot.Position).Magnitude or math.huge
+        if distance <= 18 then
+            stableSamples = stableSamples + 1
+            if stableSamples >= 6 then
+                task.wait(0.2)
+                local finalCharacter = LocalPlayer.Character
+                local finalRoot = finalCharacter
+                    and (finalCharacter:FindFirstChild("HumanoidRootPart") or finalCharacter.PrimaryPart)
+                local finalModel = findTaggedMachine(machine.id, machine.world, machine.path)
+                local finalPivotOk, finalPivot = pcall(function()
+                    return finalModel and finalModel:GetPivot() or nil
+                end)
+                if finalRoot and finalPivotOk and finalPivot then
+                    local finalDistance = (finalRoot.Position - finalPivot.Position).Magnitude
+                    if finalDistance <= 18 then
+                        return true
+                    end
+                end
+                stableSamples = 0
+            end
+        else
+            stableSamples = 0
         end
-        if char then
-            pcall(function()
-                char:PivotTo(dest)
-            end)
+        if distance > 18 then
+            placeCharacterNearMachine(currentModel, currentPivot)
         end
-        task.wait(0.25)
+        task.wait(0.1)
     end
     return false
 end
@@ -3194,7 +3287,51 @@ local function doClone(machineId, pet)
         return false
     end
 
-    local items = getStoreTable("Items", true)
+    local machine = machineById[tostring(machineId)]
+    if not machine then
+        refreshMachineList()
+        machine = machineById[tostring(machineId)]
+    end
+    if not machine then
+        return false
+    end
+
+    -- Do not trust a stale local position or a globally matched machine after a
+    -- world hop. The final check prevents sending the UID to a sibling machine.
+    local model = findTaggedMachine(machine.id, machine.world, machine.path)
+    local character = LocalPlayer.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not model or not root then
+        lastAction[machineId] = nil
+        return false
+    end
+    local targetPivotOk, targetPivot = pcall(function()
+        return model:GetPivot()
+    end)
+    if not targetPivotOk or not targetPivot then
+        lastAction[machineId] = nil
+        return false
+    end
+    local targetPosition = targetPivot.Position
+    if tostring(getPlayerValue("World", "")) ~= tostring(machine.world)
+        or (root.Position - targetPosition).Magnitude > 18 then
+        lastAction[machineId] = nil
+        return false
+    end
+
+    local cloneDataOk, cloneData = pcall(function()
+        return Store:GetData("CloneMachineData", true, 0, true)
+    end)
+    cloneData = cloneDataOk and type(cloneData) == "table" and cloneData or {}
+    if type(cloneData[machineId]) == "table" then
+        lastAction[machineId] = nil
+        return false
+    end
+
+    local itemsOk, items = pcall(function()
+        return Store:GetData("Items", true, 0, true)
+    end)
+    items = itemsOk and type(items) == "table" and items or {}
     if (tonumber(items.CloneToken) or 0) < 1 then
         return false
     end
@@ -3204,8 +3341,23 @@ local function doClone(machineId, pet)
     end
 
     local ok, err = pcall(function()
+        -- The server validates distance against its character state. Wait for
+        -- the real machine and the real player position immediately before the
+        -- remote call; never install an optimistic local clone record here.
+        local finalModel = findTaggedMachine(machine.id, machine.world, machine.path)
+        local finalCharacter = LocalPlayer.Character
+        local finalRoot = finalCharacter
+            and (finalCharacter:FindFirstChild("HumanoidRootPart") or finalCharacter.PrimaryPart)
+        local finalPivotOk, finalPivot = pcall(function()
+            return finalModel and finalModel:GetPivot() or nil
+        end)
+        if not finalModel or not finalRoot
+            or not finalPivotOk or not finalPivot
+            or tostring(getPlayerValue("World", "")) ~= tostring(machine.world)
+            or (finalRoot.Position - finalPivot.Position).Magnitude > 18 then
+            error("clone target position changed")
+        end
         AttemptClone:FireServer(pet.UID, machineId)
-        setLocalClone(machineId, pet.UID, duration)
     end)
 
     if not ok then
@@ -3214,12 +3366,15 @@ local function doClone(machineId, pet)
         return false
     end
 
-    -- Xac minh server da nhan (poll authoritative toi da 2s). That bai thi
-    -- mo khoa cho thu lai ngay vong sau thay vi khoa 4s nhu truoc.
+    -- Verify against the server-backed store only. A client-side local record
+    -- would make a rejected request look successful and cause a token loop.
     local verified = false
-    local deadline = os.clock() + 2
+    local deadline = os.clock() + 5
     while os.clock() < deadline do
-        local data = getStoreTable("CloneMachineData", true)
+        local dataOk, data = pcall(function()
+            return Store:GetData("CloneMachineData", true, 0, true)
+        end)
+        data = dataOk and type(data) == "table" and data or {}
         local record = type(data) == "table" and type(data[machineId]) == "table" and data[machineId] or nil
         if record and tostring(record.UID) == tostring(pet.UID) then
             verified = true
@@ -3241,7 +3396,10 @@ local function autoStep()
     refreshMachineList()
     refreshSelectedPetMap()
 
-    local cloneData = getStoreTable("CloneMachineData", true)
+    local cloneDataOk, cloneData = pcall(function()
+        return Store:GetData("CloneMachineData", true, 0, true)
+    end)
+    cloneData = cloneDataOk and type(cloneData) == "table" and cloneData or {}
     local now = getGameTime()
     local occupiedBy = {}
 
@@ -3251,7 +3409,10 @@ local function autoStep()
         end
     end
 
-    local items = getStoreTable("Items", true)
+    local itemsOk, items = pcall(function()
+        return Store:GetData("Items", true, 0, true)
+    end)
+    items = itemsOk and type(items) == "table" and items or {}
     local tokenCount = tonumber(items.CloneToken) or 0
     local tokenWarningShown = false
     local visitedMachine = false
@@ -4642,7 +4803,7 @@ function DungeonFarm.revealNextRouteRoom(dungeon, token)
         return false
     end
 
-    local _, startEntry = DungeonFarm.rebuildRoute(dungeon)
+    local rooms, startEntry = DungeonFarm.rebuildRoute(dungeon)
     if not startEntry or #DungeonFarm.route < 2 then
         return false
     end
@@ -4687,14 +4848,10 @@ function DungeonFarm.revealNextRouteRoom(dungeon, token)
                 -- Never reveal a room by teleporting through an active door.
                 return false
             end
-            local character = LocalPlayer.Character
-            local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
-            local previousCenter = DungeonFarm.getRoomCenter(previous.room)
-            if root and previousCenter and (root.Position - previousCenter).Magnitude <= 25 then
-                -- We are already at the completed frontier. The next room is
-                -- the only useful discovery target now.
-                walkEntry = firstIncomplete
-            else
+            -- Only fly into the next room after its connecting door is known
+            -- to be open. Otherwise stay at the completed frontier so the
+            -- normal route-door phase can discover and activate that door.
+            if not DungeonFarm.hasOpenedDoorToRoom(dungeon, rooms, firstIncomplete.room) then
                 walkEntry = previous
             end
         end
@@ -5649,6 +5806,9 @@ function DungeonFarm.getChestTargets(dungeon, focusRoom)
         if DungeonFarm.completedChests[key] then
             return
         end
+        if not DungeonFarm.isChestObjectActive(target) then
+            return
+        end
         seen[target] = true
         table.insert(targets, target)
     end
@@ -5662,6 +5822,30 @@ function DungeonFarm.getChestTargets(dungeon, focusRoom)
         end
     end
     return targets
+end
+
+function DungeonFarm.isChestObjectActive(target)
+    if not target or not target.Parent then
+        return false
+    end
+    for _, attributeName in ipairs({"Opened", "Collected", "Claimed", "Destroyed", "Dead"}) do
+        local value = target:GetAttribute(attributeName)
+        if value == true then
+            return false
+        end
+    end
+
+    local hasPart = false
+    for _, object in ipairs(target:GetDescendants()) do
+        if object:IsA("BasePart") then
+            hasPart = true
+            if object.Transparency < 0.98 then
+                return true
+            end
+        end
+    end
+    -- Some chest targets are streamed as a model before their parts arrive.
+    return not hasPart
 end
 
 function DungeonFarm.enterOpenedRouteRoom(room, token)
@@ -5857,10 +6041,32 @@ function DungeonFarm.roomHasChestObject(room)
         return false
     end
     for _, object in ipairs(room:GetDescendants()) do
-        if CollectionService:HasTag(object, "Chest")
-            or (object:IsA("Model") and object.Name == "Closed Chest") then
+        local target = object:IsA("Model") and object or object:FindFirstAncestorOfClass("Model")
+        local tagged = CollectionService:HasTag(object, "Chest")
+            or (target and CollectionService:HasTag(target, "Chest"))
+        if (tagged or (object:IsA("Model") and object.Name == "Closed Chest"))
+            and DungeonFarm.isChestObjectActive(target or object) then
             return true
         end
+    end
+    return false
+end
+
+function DungeonFarm.roomNeedsWork(dungeon, room)
+    if not (dungeon and room and room.Parent) then
+        return false
+    end
+    if DungeonFarm.getRoomConfirmPrompt(room) then
+        return true
+    end
+    local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, room)
+    if #liveEnemies > 0 or uncertainEnemies then
+        return true
+    end
+    if #DungeonFarm.getChestTargets(dungeon, room) > 0
+        or DungeonFarm.roomHasChestObject(room)
+        or DungeonFarm.roomHasPendingGoldDoor(room) then
+        return true
     end
     return false
 end
@@ -6639,9 +6845,27 @@ function DungeonFarm.start()
                 local staleTarget = DungeonFarm.targetRoom
                 if staleTarget and staleTarget.Parent and currentEntry
                     and currentEntry.room ~= staleTarget then
-                    -- Manual movement or a refreshed map invalidates the old
-                    -- focus room; let the route scanner select the room now
-                    -- under the player instead of waiting on stale state.
+                    -- Keep a room with live work as the focus even if the
+                    -- player was moved manually; otherwise the next room is
+                    -- cleared first and the unfinished room is revisited
+                    -- later, which looks like a route loop.
+                    if DungeonFarm.roomNeedsWork(dungeon, staleTarget) then
+                        DungeonFarm.room = staleTarget.Name
+                        DungeonFarm.phase = "recover_room"
+                        DungeonFarm.updateStatus(
+                            "Dungeon Farm: QUAY LAI ROOM",
+                            "Room " .. tostring(staleTarget.Name) .. " van con enemy/chest/cua; dang quay lai farm."
+                        )
+                        local target = staleTarget:FindFirstChild("RootPart") or staleTarget
+                        local character = LocalPlayer.Character
+                        local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+                        local center = DungeonFarm.getRoomCenter(staleTarget)
+                        if target and center and (not root or (root.Position - center).Magnitude > 25) then
+                            DungeonFarm.flyTo(target, token)
+                        end
+                        task.wait(0.1)
+                        continue
+                    end
                     DungeonFarm.targetRoom = nil
                     DungeonFarm.targetPart = nil
                     DungeonFarm.room = nil
@@ -8196,7 +8420,13 @@ globalEnv.__auto_clone_debug.state = function()
         liveEnemyCount = DungeonFarm.lastLiveScanCount,
         liveEnemyUncertain = DungeonFarm.lastLiveScanUncertain,
         phase = DungeonFarm.phase,
-        message = DungeonFarm.lastMessage
+        message = DungeonFarm.lastMessage,
+        fallenStarEnabled = Feature.autoFallenStarEnabled,
+        fallenStarEventActive = Feature.fallenStarFarm.lastEventActive,
+        fallenStarCount = Feature.fallenStarFarm.lastScanCount,
+        fallenStarTarget = Feature.fallenStarFarm.target and Feature.fallenStarFarm.target:GetFullName() or nil,
+        fallenStarWorld = Feature.fallenStarFarm.targetWorld and Feature.fallenStarFarm.targetWorld.Name or nil,
+        fallenStarMessage = Feature.fallenStarFarm.lastMessage
     }
 end
 
