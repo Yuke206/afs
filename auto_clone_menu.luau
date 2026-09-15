@@ -477,6 +477,7 @@ local DungeonFarm = {
     routeTarget = nil,
     goldTargetKey = nil,
     goldTargetRoom = nil,
+    greenTargetKey = nil,
     goldRoomKeys = {},
     greenRoomKeys = {},
     goldContentActive = false,
@@ -4438,6 +4439,12 @@ function DungeonFarm.markRoomCleared(room, explicitKey)
             DungeonFarm.routeKey = ""
             DungeonFarm.route = {}
         end
+    elseif DungeonFarm.greenTargetKey == key then
+        -- After all gold rooms, keep the route focused on the final green room.
+        DungeonFarm.greenTargetKey = nil
+        DungeonFarm.routeTarget = nil
+        DungeonFarm.routeKey = ""
+        DungeonFarm.route = {}
     end
     if DungeonFarm.targetRoom == room then
         DungeonFarm.targetRoom = nil
@@ -4579,9 +4586,11 @@ function DungeonFarm.rebuildRoute(dungeon)
     end
     -- Room xanh la (final) dung chung team vang; room do (boss) giu team thuong.
     DungeonFarm.greenRoomKeys = {}
-    for _, entry in ipairs(DungeonFarm.findGreenRoomsFromMap(dungeon, rooms)) do
+    local greenEntries = DungeonFarm.findGreenRoomsFromMap(dungeon, rooms)
+    for _, entry in ipairs(greenEntries) do
         DungeonFarm.greenRoomKeys[entry.key] = true
     end
+    DungeonFarm.reconcileDungeonProgress(dungeon, rooms, goldEntries)
 
     local function linkByCoordinate(entry, nextX, nextY)
         local neighbour = byCoordinate[tostring(nextX) .. ":" .. tostring(nextY)]
@@ -4677,63 +4686,85 @@ function DungeonFarm.rebuildRoute(dungeon)
     end
 
     local distances = shortestDistances(startEntry)
-    local goldEntry = DungeonFarm.goldTargetKey and entryByKey[DungeonFarm.goldTargetKey] or nil
-    if goldEntry and DungeonFarm.completed[goldEntry.key] then
-        goldEntry = nil
-        DungeonFarm.goldTargetKey = nil
+    local allGoldComplete = #goldEntries > 0
+    for _, entry in ipairs(goldEntries) do
+        if not DungeonFarm.completed[entry.key] then
+            allGoldComplete = false
+            break
+        end
     end
-    if not goldEntry then
+
+    -- Gold rooms are the primary objective. Once they are all clear, keep the
+    -- same shortest-path logic but switch the target to the final green room.
+    local targetEntries = allGoldComplete and greenEntries or goldEntries
+    local targetKey = allGoldComplete and DungeonFarm.greenTargetKey or DungeonFarm.goldTargetKey
+    local targetEntry = targetKey and entryByKey[targetKey] or nil
+    if targetEntry and DungeonFarm.completed[targetEntry.key] then
+        targetEntry = nil
+        targetKey = nil
+    end
+    if not targetEntry then
         local bestDistance = math.huge
         local bestTie = math.huge
-        for _, entry in ipairs(goldEntries) do
+        for _, entry in ipairs(targetEntries) do
             local distance = distances[entry.key]
             if not DungeonFarm.completed[entry.key] and distance ~= nil then
                 local tie = startEntry
                     and math.abs(entry.x - startEntry.x) + math.abs(entry.y - startEntry.y)
                     or math.huge
                 if distance < bestDistance
-                    or distance == bestDistance and (tie < bestTie or tie == bestTie and entry.key < (goldEntry and goldEntry.key or "~")) then
+                    or distance == bestDistance and (tie < bestTie or tie == bestTie and entry.key < (targetEntry and targetEntry.key or "~")) then
                     bestDistance = distance
                     bestTie = tie
-                    goldEntry = entry
+                    targetEntry = entry
                 end
             end
         end
-        if goldEntry then
-            DungeonFarm.goldTargetKey = goldEntry.key
-        else
+        if allGoldComplete then
+            DungeonFarm.greenTargetKey = targetEntry and targetEntry.key or nil
             DungeonFarm.goldTargetKey = nil
+            DungeonFarm.goldTargetRoom = nil
+        else
+            DungeonFarm.goldTargetKey = targetEntry and targetEntry.key or nil
+            DungeonFarm.greenTargetKey = nil
         end
+    elseif allGoldComplete then
+        DungeonFarm.greenTargetKey = targetEntry.key
+        DungeonFarm.goldTargetKey = nil
+        DungeonFarm.goldTargetRoom = nil
+    else
+        DungeonFarm.goldTargetKey = targetEntry.key
+        DungeonFarm.greenTargetKey = nil
     end
 
-    DungeonFarm.goldTargetRoom = goldEntry and goldEntry.room or nil
+    DungeonFarm.goldTargetRoom = allGoldComplete and nil or (targetEntry and targetEntry.room or nil)
     local startKey = startEntry and startEntry.key or ""
-    local targetKey = goldEntry and goldEntry.key or ""
+    local routeGoalKey = targetEntry and targetEntry.key or ""
     local routeKey = table.concat({
         startKey,
-        targetKey,
+        routeGoalKey,
         tostring(#rooms),
         tostring(nativeDoorCount),
         tostring(physicalDoorCount)
     }, "|")
     if routeKey == DungeonFarm.routeKey then
-        return rooms, startEntry, goldEntry
+        return rooms, startEntry, targetEntry
     end
     DungeonFarm.routeKey = routeKey
-    DungeonFarm.routeTarget = goldEntry and goldEntry.room or nil
+    DungeonFarm.routeTarget = targetEntry and targetEntry.room or nil
     DungeonFarm.route = {}
 
-    if not (startEntry and goldEntry) then
-        return rooms, startEntry, goldEntry
+    if not (startEntry and targetEntry) then
+        return rooms, startEntry, targetEntry
     end
 
     local _, previous = shortestDistances(startEntry)
-    if previous[goldEntry.key] == nil then
-        return rooms, startEntry, goldEntry
+    if previous[targetEntry.key] == nil then
+        return rooms, startEntry, targetEntry
     end
 
     local reversed = {}
-    local key = goldEntry.key
+    local key = targetEntry.key
     while key do
         local entry = entryByKey[key]
         if not entry then
@@ -4745,7 +4776,7 @@ function DungeonFarm.rebuildRoute(dungeon)
     for index = #reversed, 1, -1 do
         table.insert(DungeonFarm.route, reversed[index])
     end
-    return rooms, startEntry, goldEntry
+    return rooms, startEntry, targetEntry
 end
 
 function DungeonFarm.ensureMapOverlay()
@@ -5108,8 +5139,7 @@ function DungeonFarm.findGoldDoor(dungeon)
     end
 
     -- Open the door from the last completed route room to the first incomplete
-    -- one. Selecting a door that points straight to the gold room skips red
-    -- doors in multi-room routes and sends the player to a locked ConfirmPart.
+    -- one. This also handles the red/green route after all gold rooms finish.
     local sourceEntry, targetEntry
     for index, entry in ipairs(DungeonFarm.route) do
         if entry.room.Parent and not DungeonFarm.completed[entry.key] then
@@ -5128,6 +5158,12 @@ function DungeonFarm.findGoldDoor(dungeon)
         return nil
     end
 
+    -- A known route target with no matching door must wait for discovery; do
+    -- not fall back to an unrelated completed-room door.
+    if DungeonFarm.routeTarget then
+        return nil
+    end
+
     local fallback
     for _, object in ipairs(map:GetDescendants()) do
         if object:IsA("ProximityPrompt") and object.Enabled then
@@ -5135,7 +5171,7 @@ function DungeonFarm.findGoldDoor(dungeon)
             if info and info.roomKey
                 and DungeonFarm.completed[info.roomKey]
                 and not DungeonFarm.goldDoorsOpened[info.key] then
-                if not DungeonFarm.goldTargetKey
+                if not DungeonFarm.routeTarget
                     or DungeonFarm.doorLeadsToGoldTarget(info.door, info.room, dungeon) then
                     return object, info.door, info.room, info.key, info.roomKey
                 end
@@ -5143,7 +5179,7 @@ function DungeonFarm.findGoldDoor(dungeon)
             end
         end
     end
-    if not DungeonFarm.goldTargetKey and fallback then
+    if not DungeonFarm.routeTarget and fallback then
         return table.unpack(fallback)
     end
     return nil
@@ -5275,6 +5311,97 @@ function DungeonFarm.findGreenRoomsFromMap(dungeon, rooms)
         end
     end
     return result
+end
+
+function DungeonFarm.isDoorOpenForProgress(door)
+    if not door then
+        return false
+    end
+
+    local promptCount = 0
+    for _, object in ipairs(door:GetDescendants()) do
+        if object:IsA("ProximityPrompt") then
+            promptCount = promptCount + 1
+            if not object.Enabled then
+                return true
+            end
+        end
+    end
+    if promptCount > 0 then
+        return false
+    end
+
+    -- Some clients remove/disable the prompt after the door opens. Physical
+    -- state is the fallback when the prompt is no longer present.
+    for _, object in ipairs(door:GetDescendants()) do
+        if object:IsA("BasePart")
+            and (not object.CanCollide or object.Transparency >= 0.8) then
+            return true
+        end
+    end
+    return false
+end
+
+function DungeonFarm.hasOpenedDoorToRoom(dungeon, rooms, targetRoom)
+    local map = dungeon and dungeon:FindFirstChild("Map")
+    if not (map and targetRoom) then
+        return false
+    end
+
+    -- Disabled route prompts are the strongest restart-safe progress marker.
+    for _, object in ipairs(map:GetDescendants()) do
+        if object:IsA("ProximityPrompt") and not object.Enabled then
+            local info = DungeonFarm.getDoorInfo(object, map)
+            if info and info.room and DungeonFarm.doorLeadsToRoom(info.door, info.room, targetRoom) then
+                DungeonFarm.goldDoorsOpened[info.key] = true
+                return true
+            end
+        end
+    end
+
+    -- If the prompt was removed, inspect the physical Door1..Door4 model or
+    -- Door part belonging to an adjacent room.
+    for _, entry in ipairs(rooms or {}) do
+        if entry.room ~= targetRoom and entry.room.Parent then
+            for _, object in ipairs(entry.room:GetChildren()) do
+                local isDoor = (object:IsA("Model") and object.Name:match("^Door[1-4]$"))
+                    or (object:IsA("BasePart") and object.Name == "Door")
+                if isDoor
+                    and DungeonFarm.doorLeadsToRoom(object, entry.room, targetRoom)
+                    and DungeonFarm.isDoorOpenForProgress(object) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function DungeonFarm.reconcileDungeonProgress(dungeon, rooms, goldEntries)
+    local now = os.clock()
+    for _, entry in ipairs(goldEntries or {}) do
+        local key = entry.key
+        local opened = DungeonFarm.hasOpenedDoorToRoom(dungeon, rooms, entry.room)
+        if opened then
+            DungeonFarm.goldRoomsOpened[key] = true
+        end
+        if opened and not DungeonFarm.completed[key] then
+            local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, entry.room)
+            local hasConfirm = DungeonFarm.getRoomConfirmPrompt(entry.room) ~= nil
+            local hasChest = DungeonFarm.roomHasChestObject(entry.room)
+                or #DungeonFarm.getChestTargets(dungeon, entry.room) > 0
+            if #liveEnemies == 0 and not uncertainEnemies and not hasConfirm and not hasChest then
+                local emptySince = DungeonFarm.goldRoomEmptySince[key] or now
+                DungeonFarm.goldRoomEmptySince[key] = emptySince
+                if now - emptySince >= 4 then
+                    DungeonFarm.completed[key] = true
+                    DungeonFarm.goldRoomEmptySince[key] = nil
+                end
+            else
+                DungeonFarm.goldRoomEmptySince[key] = nil
+            end
+        end
+    end
 end
 
 function DungeonFarm.isGreenRunComplete(dungeon)
@@ -5836,13 +5963,13 @@ end
 
 function DungeonFarm.openGoldDoor(prompt, door, room, token)
     if not (prompt and door and room) then
-        return false, "Thieu du lieu cua gold door."
+        return false, "Thieu du lieu cua route door."
     end
     local key = door:GetFullName()
     DungeonFarm.phase = "opening_door"
-    DungeonFarm.updateStatus("Dungeon Farm: GOLD DOOR", "Dang bay toi cua vang trong room " .. tostring(room.Name) .. "...")
+    DungeonFarm.updateStatus("Dungeon Farm: ROUTE DOOR", "Dang bay toi route trong room " .. tostring(room.Name) .. "...")
     if not DungeonFarm.flyTo(door, token) then
-        return false, "Fly toi cua vang " .. tostring(room.Name) .. " that bai."
+        return false, "Fly toi route door " .. tostring(room.Name) .. " that bai."
     end
 
     local ok, err = pcall(function()
@@ -5852,7 +5979,7 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
         fireproximityprompt(prompt)
     end)
     if not ok then
-        return false, "Instant interaction cua vang loi: " .. tostring(err)
+        return false, "Instant interaction route door loi: " .. tostring(err)
     end
 
     local deadline = os.clock() + 25
@@ -5861,18 +5988,26 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
     while alive() and token == DungeonFarm.token and DungeonFarm.enabled do
         if not prompt.Parent or not prompt.Enabled then
             DungeonFarm.goldDoorsOpened[key] = true
-            DungeonFarm.goldRoomsOpened[room:GetFullName()] = true
-            DungeonFarm.goldContentActive = true
-            if DungeonFarm.routeTarget and DungeonFarm.doorLeadsToGoldTarget(door, room, DungeonFarm.getDungeon()) then
-                DungeonFarm.targetRoom = DungeonFarm.routeTarget
-                DungeonFarm.room = DungeonFarm.routeTarget.Name
-                DungeonFarm.goldRoomsOpened[DungeonFarm.routeTarget:GetFullName()] = true
+            local sourceKey = room:GetFullName()
+            if DungeonFarm.goldRoomKeys[sourceKey] then
+                DungeonFarm.goldRoomsOpened[sourceKey] = true
+            end
+            local target = DungeonFarm.routeTarget
+            if target and DungeonFarm.doorLeadsToRoom(door, room, target) then
+                DungeonFarm.targetRoom = target
+                DungeonFarm.room = target.Name
+                local targetKey = target:GetFullName()
+                local targetIsGold = DungeonFarm.goldRoomKeys[targetKey] == true
+                DungeonFarm.goldContentActive = targetIsGold
+                if targetIsGold then
+                    DungeonFarm.goldRoomsOpened[targetKey] = true
+                end
                 -- The next loop iteration enforces the gold team via the
                 -- combat/chest path, so a transient sync flap here must not
                 -- abort the run right after the door opened.
-                local targetTeamIndex, targetRole = DungeonFarm.getRoomTeamIndex(DungeonFarm.routeTarget)
+                local targetTeamIndex, targetRole = DungeonFarm.getRoomTeamIndex(target)
                 if not DungeonFarm.ensureTeamApplied(targetTeamIndex, targetRole) then
-                    DungeonFarm.lastMessage = "Da mo cua vang, dang thu lai team gold."
+                    DungeonFarm.lastMessage = "Da mo route door, dang thu lai team muc tieu."
                     DungeonFarm.updateStatus("Dungeon Farm: TEAM", DungeonFarm.lastMessage)
                 end
             end
@@ -5892,8 +6027,8 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
             local doorPos = DungeonFarm.getTargetPosition(door)
             if myRoot and doorPos and (myRoot.Position - doorPos).Magnitude > 18 then
                 DungeonFarm.updateStatus(
-                    "Dungeon Farm: GOLD DOOR",
-                    string.format("Bi day khoi cua vang, bay lai (%d)...", fireCount)
+                    "Dungeon Farm: ROUTE DOOR",
+                    string.format("Bi day khoi route door, bay lai (%d)...", fireCount)
                 )
                 DungeonFarm.flyTo(door, token)
             end
@@ -5903,7 +6038,7 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
         end
         task.wait(0.25)
     end
-    return false, "Cua vang " .. tostring(room.Name) .. " khong doi trang thai sau khi active."
+    return false, "Route door " .. tostring(room.Name) .. " khong doi trang thai sau khi active."
 end
 
 function DungeonFarm.fail(reason, token)
@@ -5988,6 +6123,7 @@ function DungeonFarm.start()
         DungeonFarm.routeTarget = nil
         DungeonFarm.goldTargetKey = nil
         DungeonFarm.goldTargetRoom = nil
+        DungeonFarm.greenTargetKey = nil
         DungeonFarm.goldRoomKeys = {}
         DungeonFarm.goldContentActive = false
         DungeonFarm.goldRoomEmptySince = {}
@@ -6061,7 +6197,7 @@ function DungeonFarm.start()
                         continue
                     end
                 end
-                DungeonFarm.rebuildRoute(dungeon)
+                local _, currentEntry = DungeonFarm.rebuildRoute(dungeon)
                 if DungeonFarm.reconcileCurrentGoldRoom(dungeon) then
                     task.wait(0.1)
                     continue
@@ -6069,6 +6205,11 @@ function DungeonFarm.start()
                 local enemies = dungeon:FindFirstChild("Enemies")
                 local focusRoom = DungeonFarm.targetRoom and DungeonFarm.targetRoom.Parent
                     and DungeonFarm.targetRoom or nil
+                if not focusRoom and currentEntry then
+                    -- Enemies from unrevealed/future rooms can exist in the
+                    -- shared Enemies folder. Only fight the current route room.
+                    focusRoom = currentEntry.room
+                end
                 local liveEnemies, uncertainEnemies
                 if focusRoom then
                     liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, focusRoom)
@@ -6191,9 +6332,7 @@ function DungeonFarm.start()
                         -- Gold da xong (dang farm room xanh): khong mo cua vang
                         -- nua, di thang toi prompt room thuong.
                         local doorPrompt, doorPart, doorRoom
-                        if DungeonFarm.greenWaitSince == nil then
-                            doorPrompt, doorPart, doorRoom = DungeonFarm.findGoldDoor(dungeon)
-                        end
+                        doorPrompt, doorPart, doorRoom = DungeonFarm.findGoldDoor(dungeon)
                         if doorPrompt then
                             if not DungeonFarm.ensureRoomTeam(doorRoom) then
                                 DungeonFarm.phase = "team_retry"
@@ -6292,7 +6431,7 @@ function DungeonFarm.start()
                                 local lastActivation = 0
                                 local activationAttempts = 0
                                 while alive() and dungeonActive and DungeonFarm.enabled and token == DungeonFarm.token do
-                                    local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+                                    local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, room)
                                     if #liveEnemies > 0 or uncertainEnemies then
                                         transitioned = true
                                         break
@@ -6352,7 +6491,7 @@ function DungeonFarm.start()
                                     return
                                 end
 
-                                local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon)
+                                local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, room)
                                 if #liveEnemies > 0 or uncertainEnemies then
                                     DungeonFarm.phase = "combat"
                                     local ok, reason = DungeonFarm.clearEnemies(dungeon, token, room)
@@ -6434,6 +6573,7 @@ local function restoreDungeonSession(reason)
     DungeonFarm.routeTarget = nil
     DungeonFarm.goldTargetKey = nil
     DungeonFarm.goldTargetRoom = nil
+    DungeonFarm.greenTargetKey = nil
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
     DungeonFarm.goldRoomEmptySince = {}
@@ -7372,6 +7512,7 @@ local function startAutoDungeon()
     DungeonFarm.routeTarget = nil
     DungeonFarm.goldTargetKey = nil
     DungeonFarm.goldTargetRoom = nil
+    DungeonFarm.greenTargetKey = nil
     DungeonFarm.goldRoomKeys = {}
     DungeonFarm.goldContentActive = false
     DungeonFarm.goldRoomEmptySince = {}
@@ -7565,6 +7706,7 @@ globalEnv.__auto_clone_debug.state = function()
         goldTeamIndex = dungeonSelection.goldTeamIndex,
         goldTargetKey = DungeonFarm.goldTargetKey,
         goldTargetRoom = DungeonFarm.goldTargetRoom and DungeonFarm.goldTargetRoom.Name or nil,
+        greenTargetKey = DungeonFarm.greenTargetKey,
         goldRoomCount = #DungeonFarm.goldRooms,
         goldCompletedCount = (function()
             local count = 0
@@ -7621,6 +7763,7 @@ dungeonFinishConnection = globalEnv.__afs_trackConnection(DungeonFinish.OnClient
                     DungeonFarm.routeTarget = nil
                     DungeonFarm.goldTargetKey = nil
                     DungeonFarm.goldTargetRoom = nil
+                    DungeonFarm.greenTargetKey = nil
                     DungeonFarm.goldRoomKeys = {}
                     DungeonFarm.phase = "idle"
                     DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Dungeon da hoan tat.")
@@ -7671,6 +7814,7 @@ if worldValue then
                         DungeonFarm.routeTarget = nil
                         DungeonFarm.goldTargetKey = nil
                         DungeonFarm.goldTargetRoom = nil
+                        DungeonFarm.greenTargetKey = nil
                         DungeonFarm.goldRoomKeys = {}
                         DungeonFarm.phase = "idle"
                         DungeonFarm.updateStatus("Dungeon Farm: SAN SANG", "Da roi khoi dungeon.")
