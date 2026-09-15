@@ -149,6 +149,11 @@ local AutoPassiveTab = Window:Tab({
     Icon = "sparkles"
 })
 
+globalEnv.__afs_fallenStarTab = Window:Tab({
+    Title = "Fallen Star",
+    Icon = "star"
+})
+
 local LocalDairebStore = require(ReplicatedStorage.ModuleScripts.LocalDairebStore)
 LocalDairebStore.WaitForInit()
 local Store = LocalDairebStore.GetStoreProxy("GameData")
@@ -359,6 +364,13 @@ local Feature = {
     autoFarmModeDropdown = nil,
     autoFarmStatusParagraph = nil,
     autoFarmToggleUpdating = false,
+    autoFallenStarEnabled = false,
+    autoFallenStarToggle = nil,
+    autoFallenStarToggleUpdating = false,
+    autoFallenStarIntervalSlider = nil,
+    autoFallenStarTeamDropdown = nil,
+    autoFallenStarStatusParagraph = nil,
+    autoFallenStarInterval = 1,
     autoPassiveEnabled = false,
     autoPassiveToggle = nil,
     autoPassiveToggleUpdating = false,
@@ -538,6 +550,7 @@ local dungeonSelection = {
     teamIndex = 1,
     normalTeamIndex = 1,
     goldTeamIndex = 1,
+    fallenStarTeamIndex = 1,
     secondArtifact = ""
 }
 local scanPets
@@ -1166,6 +1179,7 @@ local function saveConfig(silent)
                 autoDungeon = Feature.autoDungeonEnabled,
                 autoDungeonFarm = DungeonFarm.enabled,
                 autoFarm = Feature.autoFarmEnabled,
+                autoFallenStar = Feature.autoFallenStarEnabled,
                 autoPassive = Feature.autoPassiveEnabled,
                 autoCollectDrops = Feature.autoCollectDropsEnabled,
                 tpPet = Feature.tpPetEnabled,
@@ -1182,6 +1196,9 @@ local function saveConfig(silent)
             },
             autoFarm = {
                 mode = Feature.autoFarmMode
+            },
+            fallenStar = {
+                interval = Feature.autoFallenStarInterval
             },
             autoPassive = {
                 selectedUID = Feature.autoPassiveSelectedUID,
@@ -1236,6 +1253,7 @@ local function loadConfig()
             autoDungeon = data.features.autoDungeon == true,
             autoDungeonFarm = data.features.autoDungeonFarm ~= false,
             autoFarm = data.features.autoFarm == true,
+            autoFallenStar = data.features.autoFallenStar == true,
             autoPassive = data.features.autoPassive == true,
             autoCollectDrops = data.features.autoCollectDrops == true,
             tpPet = data.features.tpPet == true,
@@ -1265,6 +1283,14 @@ local function loadConfig()
         else
             Feature.autoFarmMode = Feature.MODE_NEAREST
         end
+    end
+    if type(data.fallenStar) == "table" then
+        Feature.autoFallenStarInterval = math.clamp(
+            tonumber(data.fallenStar.interval) or Feature.autoFallenStarInterval,
+            0.5,
+            10
+        )
+        Feature.fallenStarFarm.interval = Feature.autoFallenStarInterval
     end
     selectedUID = {}
     pendingSelectedPets = nil
@@ -1369,6 +1395,10 @@ local function loadConfig()
         configNeedsMigration = true
     end
     dungeonSelection.teamIndex = dungeonSelection.normalTeamIndex
+    dungeonSelection.fallenStarTeamIndex = math.max(
+        1,
+        math.floor(tonumber(dungeonSelection.fallenStarTeamIndex) or dungeonSelection.normalTeamIndex)
+    )
     dungeonSelection.mapId = normalizeDungeonMapId(dungeonSelection.mapId) or "DBZ"
     if type(data.dungeonFarm) == "table" then
         DungeonFarm.teleportDistance = DungeonFarm.normalizeTeleportDistance(data.dungeonFarm.teleportDistance)
@@ -2711,6 +2741,342 @@ local function travelToWorld(world)
     return success
 end
 
+Feature.fallenStarFarm = {
+    enabled = false,
+    interval = 1,
+    nextScanAt = 0,
+    lastSendAt = 0,
+    target = nil,
+    targetWorld = nil,
+    seen = setmetatable({}, {__mode = "k"}),
+    lastScanCount = 0,
+    lastEventActive = false,
+    lastMessage = "Chua quet.",
+    lastChatAt = 0,
+    farmStarted = false,
+    previousLocation = nil,
+    previousTeamIndex = nil
+}
+
+function Feature.fallenStarGetMeteorShowerValue()
+    local multipliers = ReplicatedStorage:FindFirstChild("Multipliers")
+    local value = multipliers and multipliers:FindFirstChild("MeteorShower")
+    return value and value:IsA("BoolValue") and value.Value == true or false
+end
+
+function Feature.fallenStarGetWorldForInstance(instance)
+    local worlds = workspace:FindFirstChild("Worlds")
+    if not worlds or not instance then
+        return nil
+    end
+    local current = instance
+    while current and current.Parent and current.Parent ~= worlds do
+        current = current.Parent
+    end
+    return current and current.Parent == worlds and current or nil
+end
+
+function Feature.fallenStarGetInstancePosition(instance)
+    if not instance then
+        return nil
+    end
+    if instance:IsA("BasePart") then
+        return instance.Position
+    end
+    local root = Feature.getRoot(instance)
+    if root then
+        return root.Position
+    end
+    local ok, pivot = pcall(function()
+        return instance:GetPivot()
+    end)
+    return ok and pivot and pivot.Position or nil
+end
+
+function Feature.fallenStarHasTargetEvidence(instance)
+    if not instance then
+        return false
+    end
+    local parentName = instance.Parent and string.lower(instance.Parent.Name) or ""
+    if parentName == "enemies" or parentName == "newenemies" then
+        return true
+    end
+    for _, name in ipairs({"Health", "MaxHealth", "Destroyable", "Targetable", "FallenStar"}) do
+        if instance:FindFirstChild(name, true) then
+            return true
+        end
+    end
+    local ok, attributes = pcall(function()
+        return instance:GetAttributes()
+    end)
+    if ok and type(attributes) == "table" then
+        for name in pairs(attributes) do
+            local lowered = string.lower(tostring(name))
+            if string.find(lowered, "health", 1, true)
+                or string.find(lowered, "target", 1, true)
+                or string.find(lowered, "destroy", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Feature.fallenStarIsCandidate(instance)
+    if not instance or not (instance:IsA("Model") or instance:IsA("BasePart")) then
+        return false
+    end
+    local world = Feature.fallenStarGetWorldForInstance(instance)
+    if not world then
+        return false
+    end
+    local name = string.lower(instance.Name):gsub("[%s_%-]", "")
+    if name ~= "fallenstar" and name ~= "meteor" and name ~= "meteorite"
+        and name ~= "stardrop" and name ~= "star" then
+        return false
+    end
+    local taggedEgg = false
+    pcall(function()
+        taggedEgg = CollectionService:HasTag(instance, "EggPurchase")
+    end)
+    if taggedEgg or not Feature.fallenStarHasTargetEvidence(instance) then
+        return false
+    end
+    return Feature.fallenStarGetInstancePosition(instance) ~= nil
+end
+
+function Feature.fallenStarPostChat(message)
+    local now = os.clock()
+    if now - Feature.fallenStarFarm.lastChatAt < 1 then
+        return
+    end
+    Feature.fallenStarFarm.lastChatAt = now
+    local sent = false
+    pcall(function()
+        local localChat = ReplicatedStorage:FindFirstChild("SendLocalChatMessage")
+        if localChat and localChat:IsA("BindableEvent") then
+            localChat:Fire(message, Color3.fromRGB(255, 235, 80))
+            sent = true
+        end
+    end)
+    if sent then
+        return
+    end
+    pcall(function()
+        local service = game:GetService("TextChatService")
+        local channel = service:FindFirstChild("TextChannels")
+            and service.TextChannels:FindFirstChild("RBXGeneral")
+        if channel then
+            channel:DisplaySystemMessage("<font color=\"#FFE750\"><b>" .. tostring(message) .. "</b></font>")
+        end
+    end)
+end
+
+function Feature.fallenStarFarm.scan(force)
+    if not Feature.fallenStarFarm.enabled then
+        return {}
+    end
+    local now = os.clock()
+    if not force and now < Feature.fallenStarFarm.nextScanAt then
+        return nil
+    end
+    Feature.fallenStarFarm.nextScanAt = now + math.max(0.5, tonumber(Feature.fallenStarFarm.interval) or 1)
+    local active = Feature.fallenStarGetMeteorShowerValue()
+    Feature.fallenStarFarm.lastEventActive = active
+    if not active then
+        Feature.fallenStarFarm.target = nil
+        Feature.fallenStarFarm.targetWorld = nil
+        Feature.fallenStarFarm.lastScanCount = 0
+        Feature.fallenStarFarm.lastMessage = "Dang cho Star Shower."
+        return {}
+    end
+
+    local worlds = workspace:FindFirstChild("Worlds")
+    local candidates = {}
+    if worlds then
+        for _, world in ipairs(worlds:GetChildren()) do
+            for _, instance in ipairs(world:GetDescendants()) do
+                if Feature.fallenStarIsCandidate(instance) then
+                    local position = Feature.fallenStarGetInstancePosition(instance)
+                    if position then
+                        local record = {instance = instance, world = world, position = position}
+                        table.insert(candidates, record)
+                        if not Feature.fallenStarFarm.seen[instance] then
+                            Feature.fallenStarFarm.seen[instance] = true
+                            Feature.fallenStarPostChat(string.format(
+                                "Fallen Star spawn tai map %s | X:%d Y:%d Z:%d",
+                                world.Name,
+                                math.floor(position.X + 0.5),
+                                math.floor(position.Y + 0.5),
+                                math.floor(position.Z + 0.5)
+                            ))
+                        end
+                    end
+                end
+            end
+        end
+    end
+    Feature.fallenStarFarm.lastScanCount = #candidates
+    local character = LocalPlayer.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    table.sort(candidates, function(a, b)
+        if not root then
+            return a.world.Name < b.world.Name
+        end
+        return (a.position - root.Position).Magnitude < (b.position - root.Position).Magnitude
+    end)
+    local selected = candidates[1]
+    Feature.fallenStarFarm.target = selected and selected.instance or nil
+    Feature.fallenStarFarm.targetWorld = selected and selected.world or nil
+    Feature.fallenStarFarm.lastMessage = selected
+        and string.format("Tim thay %d star | %s", #candidates, selected.world.Name)
+        or "Khong thay Fallen Star."
+    return candidates
+end
+
+function Feature.fallenStarFarm.captureContext()
+    if Feature.fallenStarFarm.farmStarted then
+        return
+    end
+    Feature.fallenStarFarm.previousLocation = captureLocation()
+    Feature.fallenStarFarm.previousTeamIndex = nil
+    local equipped = getStoreTable("EquippedPets", true)
+    for index, team in ipairs(getStoreTable("PetTeams", true)) do
+        local uids = type(team) == "table" and type(team.UIDs) == "table" and team.UIDs or nil
+        if uids then
+            local matched = true
+            local hasPet = false
+            for slot, uid in pairs(uids) do
+                if tostring(uid) ~= "" then
+                    hasPet = true
+                    local actual = equipped[tostring(slot)] or equipped[slot]
+                    if tostring(actual or "") ~= tostring(uid) then
+                        matched = false
+                        break
+                    end
+                end
+            end
+            if matched and hasPet then
+                Feature.fallenStarFarm.previousTeamIndex = index
+                break
+            end
+        end
+    end
+    Feature.fallenStarFarm.previousTeamIndex = Feature.fallenStarFarm.previousTeamIndex
+        or tonumber(dungeonSelection.normalTeamIndex)
+    Feature.fallenStarFarm.farmStarted = true
+end
+
+function Feature.fallenStarFarm.restoreContext()
+    if not Feature.fallenStarFarm.farmStarted then
+        return
+    end
+    local location = Feature.fallenStarFarm.previousLocation
+    local teamIndex = Feature.fallenStarFarm.previousTeamIndex
+    Feature.fallenStarFarm.farmStarted = false
+    Feature.fallenStarFarm.previousLocation = nil
+    Feature.fallenStarFarm.previousTeamIndex = nil
+
+    if teamIndex then
+        pcall(function()
+            DungeonFarm.ensureTeamApplied(teamIndex, "restore Fallen Star")
+        end)
+    end
+    if location then
+        pcall(function()
+            if travelToWorld(location.world) then
+                task.wait(0.2)
+                local character = LocalPlayer.Character
+                if character then
+                    character:PivotTo(location.cframe)
+                end
+            end
+        end)
+    end
+end
+
+function Feature.fallenStarFarm.updateStatus()
+    if not Feature.autoFallenStarStatusParagraph then
+        return
+    end
+    if not Feature.fallenStarFarm.enabled then
+        setParagraph(Feature.autoFallenStarStatusParagraph, "Auto Fallen Star: TAT", "Bat toggle de theo doi Star Shower.")
+        return
+    end
+    local eventText = Feature.fallenStarFarm.lastEventActive and "BAT" or "CHO"
+    local targetText = Feature.fallenStarFarm.target and Feature.fallenStarFarm.target.Parent
+        and (tostring(Feature.fallenStarFarm.targetWorld and Feature.fallenStarFarm.targetWorld.Name or "?") .. " / " .. Feature.fallenStarFarm.target.Name)
+        or "Khong co"
+    setParagraph(
+        Feature.autoFallenStarStatusParagraph,
+        "Auto Fallen Star: BAT | Event: " .. eventText,
+        string.format("Tim thay: %d | Target: %s | %s", Feature.fallenStarFarm.lastScanCount, targetText, Feature.fallenStarFarm.lastMessage)
+    )
+end
+
+function Feature.fallenStarFarm.step()
+    if not Feature.fallenStarFarm.enabled or dungeonActive or tostring(getPlayerValue("World", "")) == "Dungeon" then
+        return
+    end
+    local candidates = Feature.fallenStarFarm.scan(false)
+    if candidates == nil then
+        candidates = {}
+    end
+    local target = Feature.fallenStarFarm.target
+    local world = Feature.fallenStarFarm.targetWorld
+    if not target or not target.Parent or not world then
+        Feature.fallenStarFarm.restoreContext()
+        Feature.fallenStarFarm.updateStatus()
+        return
+    end
+    if not Feature.fallenStarFarm.farmStarted then
+        Feature.fallenStarFarm.captureContext()
+        local selectedTeam = math.max(1, math.floor(tonumber(dungeonSelection.fallenStarTeamIndex) or 1))
+        if not DungeonFarm.ensureTeamApplied(selectedTeam, "Fallen Star") then
+            Feature.fallenStarFarm.lastMessage = "Khong doi duoc team Fallen Star."
+            Feature.fallenStarFarm.restoreContext()
+            Feature.fallenStarFarm.updateStatus()
+            return
+        end
+    end
+    if tostring(getPlayerValue("World", "")) ~= world.Name then
+        travelToWorld(world.Name)
+        Feature.fallenStarFarm.nextScanAt = 0
+        Feature.fallenStarFarm.updateStatus()
+        return
+    end
+    local position = getInstancePosition(target)
+    if not position then
+        Feature.fallenStarFarm.target = nil
+        Feature.fallenStarFarm.updateStatus()
+        return
+    end
+    local character = LocalPlayer.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if root and (root.Position - position).Magnitude > 35 then
+        pcall(function()
+            character:PivotTo(CFrame.new(position + Vector3.new(0, 5, 0)))
+        end)
+    end
+    local sendPet = Bindable:FindFirstChild("SendPet")
+    if sendPet and os.clock() - Feature.fallenStarFarm.lastSendAt >= 1 then
+        Feature.fallenStarFarm.lastSendAt = os.clock()
+        pcall(function()
+            sendPet:Fire(target, true, true)
+        end)
+    end
+    Feature.fallenStarFarm.updateStatus()
+end
+
+function Feature.fallenStarFarm.stop()
+    Feature.fallenStarFarm.restoreContext()
+    Feature.fallenStarFarm.target = nil
+    Feature.fallenStarFarm.targetWorld = nil
+    Feature.fallenStarFarm.lastScanCount = 0
+    Feature.fallenStarFarm.lastMessage = "Da dung."
+    Feature.fallenStarFarm.seen = setmetatable({}, {__mode = "k"})
+    Feature.fallenStarFarm.updateStatus()
+end
 local function findTaggedMachine(machineId)
     for _, machine in ipairs(getTaggedMachines()) do
         local ok, id = pcall(function()
@@ -3087,7 +3453,7 @@ function Feature.updateStatus()
 end
 
 function Feature.step()
-    if not Feature.autoFarmEnabled or dungeonActive then
+    if not Feature.autoFarmEnabled or dungeonActive or Feature.autoFallenStarEnabled then
         return
     end
 
@@ -3371,6 +3737,7 @@ end
 function Feature.mainStep()
     Feature.collectDropsStep()
     Feature.attackWhileUltStep()
+    Feature.fallenStarFarm.step()
     Feature.updateMainStatus(false)
 end
 
@@ -4289,7 +4656,25 @@ function DungeonFarm.revealNextRouteRoom(dungeon, token)
             break
         end
     end
-    if not firstIncomplete or firstIncomplete.room == startEntry.room then
+    if not firstIncomplete then
+        return false
+    end
+
+    -- A resumed run can start in a room that is already empty and has no
+    -- ConfirmPart. Mark that frontier room first instead of waiting forever
+    -- for a prompt that the server will never create.
+    if firstIncomplete.room == startEntry.room then
+        local prompt = DungeonFarm.getRoomConfirmPrompt(firstIncomplete.room)
+        local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, firstIncomplete.room)
+        local chests = DungeonFarm.getChestTargets(dungeon, firstIncomplete.room)
+        if prompt or #liveEnemies > 0 or uncertainEnemies or #chests > 0
+            or DungeonFarm.roomHasPendingGoldDoor(firstIncomplete.room) then
+            return false
+        end
+        if DungeonFarm.canMarkRoomClearedSequential(dungeon, firstIncomplete.room) then
+            DungeonFarm.markRoomCleared(firstIncomplete.room, firstIncomplete.key)
+            DungeonFarm.lastMessage = "Da dong bo room frontier " .. tostring(firstIncomplete.room.Name) .. "."
+        end
         return false
     end
 
@@ -4302,7 +4687,16 @@ function DungeonFarm.revealNextRouteRoom(dungeon, token)
                 -- Never reveal a room by teleporting through an active door.
                 return false
             end
-            walkEntry = previous
+            local character = LocalPlayer.Character
+            local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+            local previousCenter = DungeonFarm.getRoomCenter(previous.room)
+            if root and previousCenter and (root.Position - previousCenter).Magnitude <= 25 then
+                -- We are already at the completed frontier. The next room is
+                -- the only useful discovery target now.
+                walkEntry = firstIncomplete
+            else
+                walkEntry = previous
+            end
         end
     end
 
@@ -4426,6 +4820,12 @@ function DungeonFarm.markRoomCleared(room, explicitKey)
     end
     if not key then
         return
+    end
+
+    -- A gold room is complete only after this exact room's entry door was
+    -- opened. Never let a route-wide scan mark a sibling gold room by proxy.
+    if DungeonFarm.goldRoomKeys[key] and not DungeonFarm.goldRoomsOpened[key] then
+        return false
     end
 
     DungeonFarm.completed[key] = true
@@ -4740,12 +5140,31 @@ function DungeonFarm.rebuildRoute(dungeon)
     DungeonFarm.goldTargetRoom = allGoldComplete and nil or (targetEntry and targetEntry.room or nil)
     local startKey = startEntry and startEntry.key or ""
     local routeGoalKey = targetEntry and targetEntry.key or ""
+    local roomSignature = {}
+    for _, entry in ipairs(rooms) do
+        table.insert(roomSignature, entry.key)
+    end
+    table.sort(roomSignature)
+
+    local connectionSignature = {}
+    for _, entry in ipairs(rooms) do
+        local neighbours = {}
+        for key in pairs(entry.neighbors) do
+            table.insert(neighbours, key)
+        end
+        table.sort(neighbours)
+        table.insert(connectionSignature, entry.key .. "=" .. table.concat(neighbours, ","))
+    end
+    table.sort(connectionSignature)
+
     local routeKey = table.concat({
         startKey,
         routeGoalKey,
         tostring(#rooms),
         tostring(nativeDoorCount),
-        tostring(physicalDoorCount)
+        tostring(physicalDoorCount),
+        table.concat(roomSignature, ";"),
+        table.concat(connectionSignature, ";")
     }, "|")
     if routeKey == DungeonFarm.routeKey then
         return rooms, startEntry, targetEntry
@@ -5378,28 +5797,17 @@ function DungeonFarm.hasOpenedDoorToRoom(dungeon, rooms, targetRoom)
 end
 
 function DungeonFarm.reconcileDungeonProgress(dungeon, rooms, goldEntries)
-    local now = os.clock()
+    -- Reconcile only the room the player is actually inside. A normal room can
+    -- expose two gold doors; treating every disabled prompt as progress here
+    -- makes both gold siblings look opened and skips the second room.
+    local currentEntry = DungeonFarm.findCurrentMapRoom(rooms)
     for _, entry in ipairs(goldEntries or {}) do
         local key = entry.key
-        local opened = DungeonFarm.hasOpenedDoorToRoom(dungeon, rooms, entry.room)
-        if opened then
+        if currentEntry and currentEntry.room == entry.room
+            and DungeonFarm.hasOpenedDoorToRoom(dungeon, rooms, entry.room) then
+            -- This is restart recovery for the current room only. Completion
+            -- still goes through the normal enemy/chest settle checks below.
             DungeonFarm.goldRoomsOpened[key] = true
-        end
-        if opened and not DungeonFarm.completed[key] then
-            local liveEnemies, uncertainEnemies = DungeonFarm.getLiveEnemies(dungeon, entry.room)
-            local hasConfirm = DungeonFarm.getRoomConfirmPrompt(entry.room) ~= nil
-            local hasChest = DungeonFarm.roomHasChestObject(entry.room)
-                or #DungeonFarm.getChestTargets(dungeon, entry.room) > 0
-            if #liveEnemies == 0 and not uncertainEnemies and not hasConfirm and not hasChest then
-                local emptySince = DungeonFarm.goldRoomEmptySince[key] or now
-                DungeonFarm.goldRoomEmptySince[key] = emptySince
-                if now - emptySince >= 4 then
-                    DungeonFarm.completed[key] = true
-                    DungeonFarm.goldRoomEmptySince[key] = nil
-                end
-            else
-                DungeonFarm.goldRoomEmptySince[key] = nil
-            end
         end
     end
 end
@@ -6198,12 +6606,23 @@ function DungeonFarm.start()
                     end
                 end
                 local _, currentEntry = DungeonFarm.rebuildRoute(dungeon)
+                local staleTarget = DungeonFarm.targetRoom
+                if staleTarget and staleTarget.Parent and currentEntry
+                    and currentEntry.room ~= staleTarget then
+                    -- Manual movement or a refreshed map invalidates the old
+                    -- focus room; let the route scanner select the room now
+                    -- under the player instead of waiting on stale state.
+                    DungeonFarm.targetRoom = nil
+                    DungeonFarm.targetPart = nil
+                    DungeonFarm.room = nil
+                end
                 if DungeonFarm.reconcileCurrentGoldRoom(dungeon) then
                     task.wait(0.1)
                     continue
                 end
                 local enemies = dungeon:FindFirstChild("Enemies")
                 local focusRoom = DungeonFarm.targetRoom and DungeonFarm.targetRoom.Parent
+                    and currentEntry and currentEntry.room == DungeonFarm.targetRoom
                     and DungeonFarm.targetRoom or nil
                 if not focusRoom and currentEntry then
                     -- Enemies from unrevealed/future rooms can exist in the
@@ -6352,18 +6771,26 @@ function DungeonFarm.start()
                             if pendingRoom and pendingRoom.Parent
                                 and not DungeonFarm.completed[pendingRoom:GetFullName()]
                                 and not DungeonFarm.getRoomConfirmPrompt(pendingRoom) then
-                                if DungeonFarm.canMarkRoomClearedSequential(dungeon, pendingRoom) then
+                                local pendingIsCurrent = currentEntry and currentEntry.room == pendingRoom
+                                if not pendingIsCurrent then
+                                    DungeonFarm.targetRoom = nil
+                                    DungeonFarm.targetPart = nil
+                                    DungeonFarm.room = nil
+                                    pendingRoom = nil
+                                elseif DungeonFarm.canMarkRoomClearedSequential(dungeon, pendingRoom) then
                                     DungeonFarm.markRoomCleared(pendingRoom)
                                     DungeonFarm.roomEmptySince[pendingRoom:GetFullName()] = nil
                                     task.wait(0.1)
                                     continue
                                 end
-                                DungeonFarm.phase = "waiting_room"
-                                DungeonFarm.lastMessage = "Dang cho room " .. tostring(pendingRoom.Name)
-                                    .. " spawn du enemy/chest truoc khi di tiep."
-                                DungeonFarm.updateStatus("Dungeon Farm: CHO ROOM", DungeonFarm.lastMessage)
-                                task.wait(0.5)
-                                continue
+                                if pendingRoom then
+                                    DungeonFarm.phase = "waiting_room"
+                                    DungeonFarm.lastMessage = "Dang cho room " .. tostring(pendingRoom.Name)
+                                        .. " spawn du enemy/chest truoc khi di tiep."
+                                    DungeonFarm.updateStatus("Dungeon Farm: CHO ROOM", DungeonFarm.lastMessage)
+                                    task.wait(0.5)
+                                    continue
+                                end
                             end
                             local prompt, room, part, key = DungeonFarm.findPrompt(dungeon)
                             if not prompt then
@@ -6534,13 +6961,15 @@ function DungeonFarm.start()
     end)
 end
 
+local startAutoDungeon
+
 local function restoreDungeonSession(reason)
     local session = dungeonSession
     if not session or session.restoring then
         return
     end
     session.restoring = true
-    dungeonActive = false
+    local dungeonActive = false
     -- Khong tat Auto Mo o day: xong 1 luot thi tu mo luot tiep (fail() va
     -- startAutoDungeon() tu tat toggle khi het summon/artifact).
     DungeonFarm.token = DungeonFarm.token + 1
@@ -7381,7 +7810,7 @@ function Feature.gateStop(reason)
     Feature.gateUpdateStatus("Auto Gate: DUNG", tostring(reason or "Da dung."))
 end
 
-local function startAutoDungeon()
+startAutoDungeon = function()
     dungeonSelection.mapId = normalizeDungeonMapId(dungeonSelection.mapId) or "DBZ"
     if tostring(getPlayerValue("World", "")) == "Dungeon" then
         dungeonActive = true
@@ -7753,7 +8182,7 @@ dungeonFinishConnection = globalEnv.__afs_trackConnection(DungeonFinish.OnClient
                     DungeonFarm.token = DungeonFarm.token + 1
                     DungeonFarm.running = false
                     DungeonFarm.entered = false
-                    dungeonActive = false
+                    local dungeonActive = false
                     DungeonFarm.sessionDungeon = nil
                     DungeonFarm.teamApplied = false
                     DungeonFarm.teamApplying = false
@@ -7804,7 +8233,7 @@ if worldValue then
                         DungeonFarm.token = DungeonFarm.token + 1
                         DungeonFarm.running = false
                         DungeonFarm.entered = false
-                        dungeonActive = false
+                        local dungeonActive = false
                         DungeonFarm.sessionDungeon = nil
                         DungeonFarm.teamApplied = false
                         DungeonFarm.teamApplying = false
@@ -8684,9 +9113,100 @@ Feature.buildGateControls = function()
     })
 end
 
+Feature.buildFallenStarControls = function()
+    local teamOptions = makeDungeonTeamOptions()
+    local defaultTeamOption = teamOptions[1]
+    for option, index in pairs(dungeonTeamByOption) do
+        if index == dungeonSelection.fallenStarTeamIndex then
+            defaultTeamOption = option
+            break
+        end
+    end
+    globalEnv.__afs_fallenStarTab:Paragraph({
+        Title = "Auto Farm Fallen Star",
+        Desc = "Theo doi Star Shower, bao map spawn tren chat va tu toi farm Fallen Star."
+    })
+    Feature.autoFallenStarStatusParagraph = globalEnv.__afs_fallenStarTab:Button({
+        Title = "Auto Fallen Star: TAT",
+        Desc = "Dang cho bat toggle.",
+        Callback = function() end
+    })
+    Feature.autoFallenStarTeamDropdown = globalEnv.__afs_fallenStarTab:Dropdown({
+        Title = "Team danh Fallen Star",
+        Desc = "Team se duoc equip truoc khi toi map co star.",
+        Values = teamOptions,
+        Value = defaultTeamOption,
+        SearchBarEnabled = true,
+        MenuWidth = 300,
+        Callback = function(value)
+            if configApplying or dropdownSyncing then
+                return
+            end
+            dungeonSelection.fallenStarTeamIndex = dungeonTeamByOption[value] or dungeonSelection.fallenStarTeamIndex
+            saveConfig(true)
+        end
+    })
+    Feature.autoFallenStarIntervalSlider = globalEnv.__afs_fallenStarTab:Slider({
+        Title = "Chu ky quet",
+        Desc = "Khoang cach quet map de tim star moi.",
+        Value = {
+            Min = 0.5,
+            Max = 10,
+            Default = Feature.autoFallenStarInterval
+        },
+        Step = 0.5,
+        Callback = function(value)
+            if configApplying or dropdownSyncing then
+                return
+            end
+            Feature.autoFallenStarInterval = math.clamp(
+                math.floor((tonumber(value) or 1) * 2 + 0.5) / 2,
+                0.5,
+                10
+            )
+            Feature.fallenStarFarm.interval = Feature.autoFallenStarInterval
+            Feature.fallenStarFarm.nextScanAt = 0
+            Feature.fallenStarFarm.updateStatus()
+            saveConfig(true)
+        end
+    })
+    globalEnv.__afs_fallenStarTab:Button({
+        Title = "Quet Fallen Star ngay",
+        Desc = "Quet thu cong va thong bao neu event dang bat.",
+        Callback = function()
+            protectedCall("Scan fallen star", function()
+                Feature.fallenStarFarm.nextScanAt = 0
+                Feature.fallenStarFarm.scan(true)
+                Feature.fallenStarFarm.updateStatus()
+            end)
+        end
+    })
+    Feature.autoFallenStarToggle = globalEnv.__afs_fallenStarTab:Toggle({
+        Title = "Bat Auto Fallen Star",
+        Desc = "Tu di map co star, tele toi vi tri va gui pet danh.",
+        Value = false,
+        Callback = function(value)
+            if Feature.autoFallenStarToggleUpdating or Feature.restoringFeatureState then
+                return
+            end
+            Feature.autoFallenStarEnabled = value == true
+            Feature.fallenStarFarm.enabled = Feature.autoFallenStarEnabled
+            Feature.fallenStarFarm.nextScanAt = 0
+            if not Feature.fallenStarFarm.enabled then
+                Feature.fallenStarFarm.stop()
+            else
+                Feature.fallenStarFarm.lastMessage = "Dang cho Star Shower."
+                Feature.fallenStarFarm.updateStatus()
+            end
+            saveConfig(true)
+        end
+    })
+end
+
 protectedCall("Build dungeon controls", buildDungeonControls)
 protectedCall("Build gate controls", Feature.buildGateControls)
 protectedCall("Build auto passive controls", AutoPassive.buildAutoPassiveControls)
+protectedCall("Build fallen star controls", Feature.buildFallenStarControls)
 
 local function selectMapped(dropdown, mapping, wanted)
     if not dropdown or wanted == nil then
@@ -8723,6 +9243,10 @@ refreshTeamOptions = function()
         dungeonSelection.goldTeamIndex or dungeonSelection.normalTeamIndex,
         dungeonSelection.normalTeamIndex
     )
+    dungeonSelection.fallenStarTeamIndex = clampTeamIndex(
+        dungeonSelection.fallenStarTeamIndex or dungeonSelection.normalTeamIndex,
+        dungeonSelection.normalTeamIndex
+    )
     dungeonSelection.teamIndex = dungeonSelection.normalTeamIndex
 
     local gateFarm = Feature.gateFarm
@@ -8732,6 +9256,7 @@ refreshTeamOptions = function()
     for _, dropdown in pairs({
         dungeonNormalTeamDropdown,
         dungeonGoldTeamDropdown,
+        Feature.autoFallenStarTeamDropdown,
         gateFarm.teamDropdown
     }) do
         if dropdown then
@@ -8816,6 +9341,11 @@ syncDungeonControls = function()
         dungeonTeamByOption,
         dungeonSelection.goldTeamIndex or dungeonSelection.normalTeamIndex or dungeonSelection.teamIndex
     )
+    selectMapped(
+        Feature.autoFallenStarTeamDropdown,
+        dungeonTeamByOption,
+        dungeonSelection.fallenStarTeamIndex or dungeonSelection.normalTeamIndex or dungeonSelection.teamIndex
+    )
     selectMapped(dungeonSecondArtifactDropdown, dungeonArtifactByOption, dungeonSelection.secondArtifact)
     local sizeNames = {[0] = "Small", [1] = "Medium", [2] = "Large", [3] = "Insane", [4] = "Hellish"}
     pcall(function()
@@ -8848,6 +9378,11 @@ Feature.syncControls = function()
             Feature.autoFarmModeDropdown:Select(Feature.modeLabel(Feature.autoFarmMode))
         end)
     end
+    if Feature.autoFallenStarIntervalSlider then
+        pcall(function()
+            Feature.autoFallenStarIntervalSlider:Set(Feature.autoFallenStarInterval)
+        end)
+    end
     if Feature.syncAutoPassiveControls then
         Feature.syncAutoPassiveControls()
     end
@@ -8877,6 +9412,8 @@ Feature.applySavedState = function()
     end
     autoEnabled = false
     Feature.autoFarmEnabled = false
+    Feature.autoFallenStarEnabled = false
+    Feature.fallenStarFarm.enabled = false
     Feature.autoDungeonEnabled = false
     Feature.autoPassiveEnabled = false
     Feature.autoPassiveRunToken = Feature.autoPassiveRunToken + 1
@@ -8888,6 +9425,9 @@ Feature.applySavedState = function()
     end)
     setToggleSilently(Feature.autoFarmToggle, false, function(value)
         Feature.autoFarmToggleUpdating = value
+    end)
+    setToggleSilently(Feature.autoFallenStarToggle, false, function(value)
+        Feature.autoFallenStarToggleUpdating = value
     end)
     setToggleSilently(dungeonToggle, false, function(value)
         dungeonToggleUpdating = value
@@ -8925,6 +9465,15 @@ Feature.applySavedState = function()
         Feature.autoFarmEnabled = true
         setToggleSilently(Feature.autoFarmToggle, true, function(value)
             Feature.autoFarmToggleUpdating = value
+        end)
+    end
+
+    if desired.autoFallenStar then
+        Feature.autoFallenStarEnabled = true
+        Feature.fallenStarFarm.enabled = true
+        Feature.fallenStarFarm.nextScanAt = 0
+        setToggleSilently(Feature.autoFallenStarToggle, true, function(value)
+            Feature.autoFallenStarToggleUpdating = value
         end)
     end
 
@@ -9021,6 +9570,7 @@ Feature.applySavedState = function()
     end
     Feature.updateMainStatus(true)
     Feature.updateAutoPassiveStatus()
+    Feature.fallenStarFarm.updateStatus()
 end
 
 local setupStarted = false
