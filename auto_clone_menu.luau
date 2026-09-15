@@ -5664,6 +5664,31 @@ function DungeonFarm.getChestTargets(dungeon, focusRoom)
     return targets
 end
 
+function DungeonFarm.enterOpenedRouteRoom(room, token)
+    if not (room and room.Parent) then
+        return false, "Route room da bi dong sau khi mo cua."
+    end
+
+    local target = room:FindFirstChild("RootPart") or room
+    if not DungeonFarm.getRoomCenter(room) then
+        return false, "Khong tim thay tam route room " .. tostring(room.Name) .. "."
+    end
+
+    DungeonFarm.phase = "route_enter"
+    DungeonFarm.updateStatus(
+        "Dungeon Farm: VAO ROOM",
+        "Da mo cua; dang bay vao room " .. tostring(room.Name) .. " de kich hoat/farm..."
+    )
+    if not DungeonFarm.flyTo(target, token) then
+        return false, "Fly vao route room " .. tostring(room.Name) .. " that bai."
+    end
+
+    -- Let the newly opened room replicate before the next loop scans enemies,
+    -- chests, and its ConfirmPart. This prevents jumping to a later prompt.
+    task.wait(0.35)
+    return true
+end
+
 function DungeonFarm.canMarkRoomClearedSequential(dungeon, room)
     if not (dungeon and room and room.Parent) then
         return false
@@ -6403,6 +6428,7 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
             local target = DungeonFarm.routeTarget
             if target and DungeonFarm.doorLeadsToRoom(door, room, target) then
                 DungeonFarm.targetRoom = target
+                DungeonFarm.targetPart = nil
                 DungeonFarm.room = target.Name
                 local targetKey = target:GetFullName()
                 local targetIsGold = DungeonFarm.goldRoomKeys[targetKey] == true
@@ -6417,6 +6443,10 @@ function DungeonFarm.openGoldDoor(prompt, door, room, token)
                 if not DungeonFarm.ensureTeamApplied(targetTeamIndex, targetRole) then
                     DungeonFarm.lastMessage = "Da mo route door, dang thu lai team muc tieu."
                     DungeonFarm.updateStatus("Dungeon Farm: TEAM", DungeonFarm.lastMessage)
+                end
+                local entered, enterReason = DungeonFarm.enterOpenedRouteRoom(target, token)
+                if not entered then
+                    return false, enterReason
                 end
             end
             return true, "Da mo cua vang."
